@@ -486,22 +486,3 @@ export function fileExtent(rowGroups: RowGroupInfo[]): Bbox | null {
   }
   return extent;
 }
-
-// Fold an interleaved xy position array into its bounding box, or null when
-// empty. Used to turn a decoded overview row group into a covering bbox.
-export function extentOfPositions(positions: Float64Array): Bbox | null {
-  if (positions.length === 0) return null;
-  let xmin = Infinity;
-  let ymin = Infinity;
-  let xmax = -Infinity;
-  let ymax = -Infinity;
-  for (let i = 0; i < positions.length; i += 2) {
-    const x = positions[i];
-    const y = positions[i + 1];
-    if (x < xmin) xmin = x;
-    if (y < ymin) ymin = y;
-    if (x > xmax) xmax = x;
-    if (y > ymax) ymax = y;
-  }
-  return { xmin, ymin, xmax, ymax };
-}

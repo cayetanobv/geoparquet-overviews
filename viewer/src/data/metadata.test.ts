@@ -3,7 +3,6 @@ import {
   levelForZoom,
   columnForLevel,
   rowGroupsForLevel,
-  extentOfPositions,
   coarseColumnIntervals,
   computeFileFacts,
   columnChunkBytes,
@@ -158,17 +157,6 @@ describe('rowGroupsForLevel', () => {
     // The exact band would include the row groups past 19.
     const level2 = rowGroupsForLevel(rowGroups, INFO.levels[2], aoi);
     expect(Math.max(...level2)).toBeGreaterThan(19);
-  });
-});
-
-describe('extentOfPositions', () => {
-  it('folds interleaved xy positions into a bbox', () => {
-    const positions = Float64Array.from([-79, 37, -78, 38, -80, 36.5]);
-    expect(extentOfPositions(positions)).toEqual({ xmin: -80, ymin: 36.5, xmax: -78, ymax: 38 });
-  });
-
-  it('returns null for empty positions', () => {
-    expect(extentOfPositions(Float64Array.from([]))).toBeNull();
   });
 });
 

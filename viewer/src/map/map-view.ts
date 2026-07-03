@@ -73,12 +73,6 @@ export class MapView {
     this.map.easeTo({ zoom, duration: 300 });
   }
 
-  // Subscribe to the end of a zoom gesture. Returns an unsubscribe function.
-  onZoomEnd(cb: () => void): () => void {
-    this.map.on('zoomend', cb);
-    return () => this.map.off('zoomend', cb);
-  }
-
   // Subscribe to any camera move end (pan or zoom), used to keep the overview
   // mini-map's viewport rectangle in sync with this map. Returns unsubscribe.
   onMoveEnd(cb: () => void): () => void {

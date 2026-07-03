@@ -125,12 +125,6 @@ export class AppRoot extends LitElement {
   render() {
     return html`
       <div class="app-shell">
-        <div class="topbar">
-          <div class="brand">
-            <p class="eyebrow"><span class="dot"></span> GeoParquet overviews · read-path inspector</p>
-            <h1>The read path, traced live</h1>
-          </div>
-        </div>
         ${this.renderInspectTab()}
       </div>
     `;
