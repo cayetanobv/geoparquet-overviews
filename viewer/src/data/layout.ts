@@ -21,7 +21,9 @@ export interface ReadPlan {
   // ordinal for the overviews path, since several coarse levels can share one
   // overview column, and a fixed token for the flat path.
   lodKey: string;
-  decode: (rawValues: unknown[]) => FlatGeometries;
+  // `rows` is the parallel absolute-parquet-row of each raw value, carried
+  // through so a picked geometry resolves to its source row for the click popup.
+  decode: (rawValues: unknown[], rows?: ArrayLike<number>) => FlatGeometries;
 }
 
 // Decode a batch of geometry values into flat buckets. With hyparquet's parser
@@ -29,13 +31,17 @@ export interface ReadPlan {
 // zero-copy scanner runs; the GeoJSON flattener is kept as a fallback in case any
 // value is already a decoded object (belt and braces during the transition). The
 // probe skips leading nulls, which the finest band's null geom_overview yields.
-function decodeGeometries(values: unknown[], transform: CoordTransform | null): FlatGeometries {
+function decodeGeometries(
+  values: unknown[],
+  transform: CoordTransform | null,
+  rows?: ArrayLike<number>,
+): FlatGeometries {
   for (const v of values) {
     if (v == null) continue;
-    if (v instanceof Uint8Array) return flattenWkb(values, transform);
-    return flattenGeoJson(values, transform);
+    if (v instanceof Uint8Array) return flattenWkb(values, transform, rows);
+    return flattenGeoJson(values, transform, rows);
   }
-  return flattenWkb(values, transform);
+  return flattenWkb(values, transform, rows);
 }
 
 export interface LayoutStrategy {
@@ -66,7 +72,7 @@ function flatStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
         : metadata.rowGroups.map((rg) => rg.index),
       column: 'geometry',
       lodKey: 'flat',
-      decode: (geometries) => decodeGeometries(geometries, transform),
+      decode: (geometries, rows) => decodeGeometries(geometries, transform, rows),
     }),
   };
 }
@@ -86,7 +92,7 @@ function overviewsStrategy(metadata: GeoParquetMetadata): LayoutStrategy {
         indices: rowGroupsForLevel(metadata.rowGroups, level, aoi),
         column,
         lodKey: `L${level.level}:${column}`,
-        decode: (geometries) => decodeGeometries(geometries, transform),
+        decode: (geometries, rows) => decodeGeometries(geometries, transform, rows),
       };
     },
   };

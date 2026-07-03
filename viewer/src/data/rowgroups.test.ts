@@ -37,7 +37,7 @@ describe('readColumnProgressive', () => {
     let painting = false;
     let overlapped = false;
     const painted: number[] = [];
-    await readColumnProgressive('u', ranges(8), 'geometry', async (_geoms, idx) => {
+    await readColumnProgressive('u', ranges(8), 'geometry', async (_geoms, _rows, idx) => {
       if (painting) overlapped = true; // two paints interleaved
       painting = true;
       await Promise.resolve();
@@ -61,11 +61,33 @@ describe('readColumnProgressive', () => {
     const pruned: RowGroupRange[] = [
       { index: 0, rowStart: 0, rowEnd: 100, subRanges: [{ rowStart: 5, rowEnd: 10 }, { rowStart: 40, rowEnd: 50 }] },
     ];
-    await readColumnProgressive('u', pruned, 'geometry', (_g, idx) => {
+    await readColumnProgressive('u', pruned, 'geometry', (_g, _rows, idx) => {
       paints.push(idx[0]);
     });
     expect(spans).toEqual([[5, 10], [40, 50]]); // both sub-ranges read
     expect(paints).toEqual([0]); // painted once for the group
+  });
+
+  it('carries each geometry its absolute row and drops nulls', async () => {
+    parquetRead.mockImplementation(async ({ rowStart, rowEnd, onChunk }: any) => {
+      // A null geometry at the second row of the span; the rest are present.
+      const columnData = Array.from({ length: rowEnd - rowStart }, (_, i) =>
+        i === 1 ? null : new Uint8Array([1]),
+      );
+      onChunk({ columnData, rowStart, rowEnd });
+    });
+    const seen: { rows: number[]; count: number }[] = [];
+    await readColumnProgressive(
+      'u',
+      [{ index: 0, rowStart: 10, rowEnd: 15 }],
+      'geometry',
+      (geoms, rows) => {
+        seen.push({ rows: rows.slice(), count: geoms.length });
+      },
+    );
+    // Rows 10..14 minus the null at 11, so four geometries carrying their
+    // absolute file rows, not the compacted array positions.
+    expect(seen).toEqual([{ rows: [10, 12, 13, 14], count: 4 }]);
   });
 
   it('stops pulling new groups once shouldStop trips', async () => {
@@ -78,7 +100,7 @@ describe('readColumnProgressive', () => {
       'u',
       ranges(20),
       'geometry',
-      (_g, idx) => {
+      (_g, _rows, idx) => {
         painted.push(idx[0]);
         if (painted.length >= 2) stop = true;
       },

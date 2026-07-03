@@ -14,12 +14,16 @@ import {
   loadMetadataFromUrl,
   fileExtent,
   schemaLookup,
+  attributeColumns,
   hasRenderableGeometry,
   computeFileFacts,
   type GeoParquetMetadata,
   type FileFacts,
 } from '../data/metadata';
 import { readColumnProgressive, getFileForUrl, type RowGroupRange } from '../data/rowgroups';
+import { readRowAttributes } from '../data/feature-detail';
+import { featureLoadingHtml, featureAttributesHtml, featureErrorHtml } from './feature-popup';
+import type { PickingInfo } from '@deck.gl/core';
 import { pageRangesForRowGroup, mergePageRanges } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
@@ -99,6 +103,17 @@ export class AppRoot extends LitElement {
   // change) does not refetch the identical bbox and band.
   private lastFetchKey: string | null = null;
   private strategy: LayoutStrategy | null = null;
+  // The flattened buckets currently on the map, keyed by the layer-set id prefix
+  // (`rg-batch-N` during progressive load, `rg-merged` once settled). A click
+  // resolves `info.layer.id` to a prefix and a geometry kind, then reads the
+  // matching bucket's rowIds at `info.index` to recover the source parquet row.
+  private pickFlats = new Map<string, FlatGeometries>();
+  // The file's non-geometry attribute columns, read once per load, fetched for a
+  // clicked feature's popup.
+  private attrColumns: string[] = [];
+  // Supersedes an in-flight attribute read when a newer feature is clicked, so a
+  // slow read never overwrites a newer popup.
+  private pickToken = 0;
 
   constructor() {
     super();
@@ -208,6 +223,7 @@ export class AppRoot extends LitElement {
     const container = this.querySelector('.map-container') as HTMLElement | null;
     if (container) {
       this.mapView = new MapView(container);
+      this.mapView.setPickHandler(this.onFeaturePick);
       this.currentZoom = this.mapView.getZoom();
       this.viewBbox = this.mapView.getBounds();
       // The map view is the area. Every settled pan or zoom updates the mini
@@ -264,6 +280,69 @@ export class AppRoot extends LitElement {
 
   private onRowGroupHover(event: CustomEvent<{ index: number | null }>) {
     this.hoveredIndex = event.detail.index;
+  }
+
+  // A click on the map. Resolve the picked primitive to its parquet row, open a
+  // popup at the click point, then fetch and show that row's attribute columns.
+  // An empty click (or an unresolvable one) just dismisses any open popup.
+  private onFeaturePick = (info: PickingInfo) => {
+    if (!this.mapView) return;
+    if (!info.picked || !info.layer || !info.coordinate) {
+      this.mapView.closeFeaturePopup();
+      return;
+    }
+    const row = this.resolvePickedRow(info.layer.id, info.index);
+    if (row == null) {
+      this.mapView.closeFeaturePopup();
+      return;
+    }
+    const lngLat: [number, number] = [info.coordinate[0], info.coordinate[1]];
+    const token = ++this.pickToken;
+    this.mapView.openFeaturePopup(lngLat, featureLoadingHtml(row));
+
+    const url = this.currentUrl;
+    if (!url || this.attrColumns.length === 0) {
+      // No columns to read (or no file), so show the row with an empty table
+      // rather than spin forever.
+      this.mapView.setFeaturePopupHtml(featureAttributesHtml(row, {}));
+      return;
+    }
+    void readRowAttributes(url, row, this.attrColumns)
+      .then((attrs) => {
+        // A newer click superseded this read, so drop its result.
+        if (token !== this.pickToken || !this.mapView) return;
+        this.mapView.setFeaturePopupHtml(featureAttributesHtml(row, attrs));
+      })
+      .catch((err) => {
+        if (token !== this.pickToken || !this.mapView) return;
+        this.mapView.setFeaturePopupHtml(featureErrorHtml(row, err));
+      });
+  };
+
+  // Map a picked layer id and primitive index back to the source parquet row via
+  // the registered buckets. Layer ids are `${prefix}-${kind}` with kind one of
+  // poly, holed, line, point (outlines are not pickable), and each bucket's
+  // rowIds is one absolute row per primitive, the same ordinal deck.gl reports as
+  // info.index. Returns null when the layer or index does not resolve.
+  private resolvePickedRow(layerId: string, index: number): number | null {
+    const dash = layerId.lastIndexOf('-');
+    if (dash < 0) return null;
+    const prefix = layerId.slice(0, dash);
+    const kind = layerId.slice(dash + 1);
+    const flat = this.pickFlats.get(prefix);
+    if (!flat) return null;
+    const rowIds =
+      kind === 'poly'
+        ? flat.polygons.rowIds
+        : kind === 'holed'
+          ? flat.holedPolygons.rowIds
+          : kind === 'line'
+            ? flat.paths.rowIds
+            : kind === 'point'
+              ? flat.points.rowIds
+              : null;
+    if (!rowIds || index < 0 || index >= rowIds.length) return null;
+    return rowIds[index];
   }
 
   private onMapMove = () => {
@@ -388,6 +467,10 @@ export class AppRoot extends LitElement {
     (this.querySelector('load-stats') as LoadStats | null)?.resetSession();
     this.currentUrl = url;
     this.reflectUrlParam(url);
+    // A new file invalidates any pick state and open popup from the previous one.
+    this.pickFlats.clear();
+    this.attrColumns = [];
+    this.mapView.closeFeaturePopup();
     this.aoiBbox = null;
     this.fetchedIndices = new Set();
     this.pendingWorking = new Set();
@@ -408,6 +491,7 @@ export class AppRoot extends LitElement {
       if (loadToken !== this.loadToken) return;
       this.metadataMs = performance.now() - t0;
       this.metadata = metadata;
+      this.attrColumns = attributeColumns(metadata);
       this.strategy = detectLayout(metadata);
       await this.strategy.prepare(url);
       this.fileBytes = metadata.rowGroups.reduce((sum, rg) => sum + rg.totalByteSize, 0);
@@ -512,6 +596,10 @@ export class AppRoot extends LitElement {
     // meter, waterfall, layout heatmap) and the map before this area's requests.
     this.resetViz();
     this.mapView.clearLayers();
+    // The old view's layers are gone, so its pick provenance and any open popup
+    // are stale. Drop them before the new batches register their own.
+    this.pickFlats.clear();
+    this.mapView.closeFeaturePopup();
 
     const plan = this.strategy!.planRead(bbox, zoom);
     const indices = plan.indices;
@@ -622,9 +710,13 @@ export class AppRoot extends LitElement {
       batches.push(flat);
 
       const tUpload = performance.now();
+      const batchId = `rg-batch-${batchOrdinal}`;
       timeWork('gpu-upload', `${batchFeatures} geometries`, () =>
-        this.mapView!.addLayers(buildLayers(`rg-batch-${batchOrdinal}`, flat)),
+        this.mapView!.addLayers(buildLayers(batchId, flat)),
       );
+      // Register this batch's buckets so a click during progressive load still
+      // resolves to a row; the end-of-fetch merge replaces these with rg-merged.
+      this.pickFlats.set(batchId, flat);
       uploadMs += performance.now() - tUpload;
       batchOrdinal += 1;
 
@@ -687,14 +779,14 @@ export class AppRoot extends LitElement {
         url,
         uncachedRanges,
         column,
-        async (geometries, batchIndices) => {
+        async (geometries, rows, batchIndices) => {
         // A newer view fetch started, so stop painting this stale one. The
         // reader also bails at the next row-group boundary via shouldStop below,
         // so a fast pan or zoom abandons the stale read instead of waiting it out.
         if (token !== this.fetchToken) return;
 
         const tDecode = performance.now();
-        const flat = timeWork('wkb-decode', `${geometries.length} geometries`, () => plan.decode(geometries));
+        const flat = timeWork('wkb-decode', `${geometries.length} geometries`, () => plan.decode(geometries, rows));
         decodeMs += performance.now() - tDecode;
 
         // Cache the per-group decode before merging, so a repeat view reuses it.
@@ -721,6 +813,10 @@ export class AppRoot extends LitElement {
       timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
         this.mapView!.setLayers(buildLayers('rg-merged', merged)),
       );
+      // The per-batch layers are gone, so their pick provenance is too. Register
+      // the merged buckets under the merged id the new layers carry.
+      this.pickFlats.clear();
+      this.pickFlats.set('rg-merged', merged);
       this.status = `Rendered ${features.toLocaleString('en-US')} features from ${total} row groups, ${readingLabel}.${pruneNote}`;
     } catch (err) {
       if (token !== this.fetchToken) return;

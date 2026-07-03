@@ -24,6 +24,14 @@ export interface RowGroupRange {
   subRanges?: { rowStart: number; rowEnd: number }[];
 }
 
+// One row group's read result: the kept geometry values and their absolute
+// parquet rows, aligned index for index. The rows travel with the geometry so
+// the decoder can stamp each rendered primitive with its source row.
+interface GroupValues {
+  geometries: unknown[];
+  rows: number[];
+}
+
 // The cached file handle for a url, so the page-index reader can slice the
 // ColumnIndex and OffsetIndex byte ranges over the same range-request buffer the
 // column reads use, without re-probing the file.
@@ -75,7 +83,7 @@ export async function readColumnProgressive(
   url: string,
   ranges: RowGroupRange[],
   column: string,
-  onBatch: (geometries: unknown[], indices: number[]) => void | Promise<void>,
+  onBatch: (geometries: unknown[], rows: number[], indices: number[]) => void | Promise<void>,
   shouldStop?: () => boolean,
 ): Promise<void> {
   const { file, metadata } = await getCachedFile(url);
@@ -88,13 +96,18 @@ export async function readColumnProgressive(
   // Read one whole row group (all its page sub-ranges) into a flat value array.
   // Returns null if cancellation tripped mid-read, so its partial result is
   // never painted.
-  const readGroup = async (range: RowGroupRange): Promise<unknown[] | null> => {
+  const readGroup = async (range: RowGroupRange): Promise<GroupValues | null> => {
     // A page-pruned group reads its sub-ranges, otherwise the whole group span.
     // useOffsetIndex is a no-op for a whole-group span (the range covers the
     // group, so hyparquet reads the whole chunk) and only prunes pages for a
     // sub-range, so it is safe to set for every read.
     const spans = range.subRanges ?? [{ rowStart: range.rowStart, rowEnd: range.rowEnd }];
     const geometries: unknown[] = [];
+    // The absolute parquet row of each kept geometry, aligned with `geometries`.
+    // Nulls are dropped so the array index is not the row ordinal, so the row is
+    // tracked here explicitly and carried to onBatch, where the flattener stamps
+    // it onto every rendered primitive for pick-to-row resolution.
+    const rows: number[] = [];
     for (const span of spans) {
       if (stopped()) return null;
       await parquetRead({
@@ -109,27 +122,31 @@ export async function readColumnProgressive(
         parsers: RAW_WKB_PARSERS,
         onChunk: (chunk) => {
           // A chunk may spill past the requested span, so clip to the overlap
-          // and index into the chunk by its own rowStart.
+          // and index into the chunk by its own rowStart. `r` is the absolute
+          // file row, so it is exactly the provenance a kept geometry needs.
           const from = Math.max(span.rowStart, chunk.rowStart);
           const to = Math.min(span.rowEnd, chunk.rowEnd);
           const data = chunk.columnData;
           for (let r = from; r < to; r++) {
             const v = data[r - chunk.rowStart];
-            if (v != null) geometries.push(v);
+            if (v != null) {
+              geometries.push(v);
+              rows.push(r);
+            }
           }
         },
       });
     }
-    return geometries;
+    return { geometries, rows };
   };
 
   // Serialize onBatch. Each read awaits its turn on this chain, so paints never
   // interleave no matter which reads finish first.
   let paintChain: Promise<void> = Promise.resolve();
-  const paint = (geometries: unknown[], index: number): Promise<void> => {
+  const paint = (values: GroupValues, index: number): Promise<void> => {
     paintChain = paintChain.then(() => {
       if (stopped()) return;
-      return onBatch(geometries, [index]);
+      return onBatch(values.geometries, values.rows, [index]);
     });
     return paintChain;
   };
@@ -143,15 +160,15 @@ export async function readColumnProgressive(
       const i = next++;
       if (i >= ranges.length) return;
       const range = ranges[i];
-      let geometries: unknown[] | null;
+      let values: GroupValues | null;
       try {
-        geometries = await readGroup(range);
+        values = await readGroup(range);
       } catch (err) {
         aborted = true;
         throw err;
       }
-      if (geometries === null || stopped()) return;
-      await paint(geometries, range.index);
+      if (values === null || stopped()) return;
+      await paint(values, range.index);
     }
   };
 
