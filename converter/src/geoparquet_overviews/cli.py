@@ -99,9 +99,5 @@ def convert_cmd(
     click.echo(json.dumps(summary, indent=2))
 
 
-# Register the command under the plain name `convert`.
-main.add_command(convert_cmd, name="convert")
-
-
 if __name__ == "__main__":
     main()
