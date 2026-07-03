@@ -33,17 +33,22 @@ export interface FlatCache {
 const DEFAULT_BUDGET = 192 * 1024 * 1024;
 
 // Resident-byte estimate for one entry. Every bucket, holed polygons included, is
-// now a flat typed array, so the estimate is the exact sum of their byteLengths.
+// now a flat typed array, so the estimate is the exact sum of their byteLengths,
+// including the per-primitive rowIds provenance arrays.
 export function flatEntryBytes(flat: FlatGeometries): number {
   return (
     flat.points.positions.byteLength +
+    flat.points.rowIds.byteLength +
     flat.paths.positions.byteLength +
     flat.paths.startIndices.byteLength +
+    flat.paths.rowIds.byteLength +
     flat.polygons.positions.byteLength +
     flat.polygons.startIndices.byteLength +
+    flat.polygons.rowIds.byteLength +
     flat.holedPolygons.positions.byteLength +
     flat.holedPolygons.polygonStartIndices.byteLength +
-    flat.holedPolygons.ringStartIndices.byteLength
+    flat.holedPolygons.ringStartIndices.byteLength +
+    flat.holedPolygons.rowIds.byteLength
   );
 }
 

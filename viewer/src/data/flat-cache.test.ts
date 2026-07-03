@@ -15,13 +15,17 @@ describe('flatEntryBytes', () => {
     const flat = flattenGeoJson([point(1, 2), point(3, 4)]);
     expect(flatEntryBytes(flat)).toBe(
       flat.points.positions.byteLength +
+        flat.points.rowIds.byteLength +
         flat.paths.positions.byteLength +
         flat.paths.startIndices.byteLength +
+        flat.paths.rowIds.byteLength +
         flat.polygons.positions.byteLength +
         flat.polygons.startIndices.byteLength +
+        flat.polygons.rowIds.byteLength +
         flat.holedPolygons.positions.byteLength +
         flat.holedPolygons.polygonStartIndices.byteLength +
-        flat.holedPolygons.ringStartIndices.byteLength,
+        flat.holedPolygons.ringStartIndices.byteLength +
+        flat.holedPolygons.rowIds.byteLength,
     );
   });
 });

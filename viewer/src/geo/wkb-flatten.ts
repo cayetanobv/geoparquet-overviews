@@ -110,6 +110,7 @@ function readPolygon(c: WkbCursor, extra: number, b: FlatBuilders): void {
     if (n === 0) return;
     b.polyVertices += n;
     b.polyStarts.push(b.polyVertices);
+    b.polyRows.push(b.currentRow);
     return;
   }
   let ringsAdded = 0;
@@ -120,7 +121,10 @@ function readPolygon(c: WkbCursor, extra: number, b: FlatBuilders): void {
     b.holedRingStarts.push(b.holedVertices);
     ringsAdded += 1;
   }
-  if (ringsAdded > 0) b.holedPolyStarts.push(b.holedVertices);
+  if (ringsAdded > 0) {
+    b.holedPolyStarts.push(b.holedVertices);
+    b.holedRows.push(b.currentRow);
+  }
 }
 
 // Read one geometry (header plus body) and route it into the builders. Multis and
@@ -132,7 +136,10 @@ function readGeometry(c: WkbCursor, b: FlatBuilders): void {
       // Point. A NaN coordinate is the WKB idiom for an empty point; skip it so
       // it does not paint a dot at (NaN, NaN).
       const [x, y] = readXY(c, extra);
-      if (!Number.isNaN(x) && !Number.isNaN(y)) b.pointPos.push2(x, y);
+      if (!Number.isNaN(x) && !Number.isNaN(y)) {
+        b.pointPos.push2(x, y);
+        b.pointRows.push(b.currentRow);
+      }
       break;
     }
     case 2: {
@@ -141,6 +148,7 @@ function readGeometry(c: WkbCursor, b: FlatBuilders): void {
       if (n > 0) {
         b.pathVertices += n;
         b.pathStarts.push(b.pathVertices);
+        b.pathRows.push(b.currentRow);
       }
       break;
     }
@@ -179,13 +187,22 @@ function readGeometry(c: WkbCursor, b: FlatBuilders): void {
 // Flatten an array of raw WKB values into the shared bucket shape. null/undefined
 // entries are skipped (the finest band carries a null geom_overview; an exact
 // read should see no nulls but this stays safe). A malformed value throws.
+//
+// `rows` is the parallel absolute-parquet-row of each value (aligned index for
+// index, both already null-compacted by the reader), stamped onto every primitive
+// so a picked geometry resolves to its source row. When omitted, each value's
+// position stands in, which is enough for the equivalence tests but not for the
+// click popup, so the read path always supplies it.
 export function flattenWkb(
   values: unknown[],
   transform?: CoordTransform | null,
+  rows?: ArrayLike<number>,
 ): FlatGeometries {
   const b = new FlatBuilders();
-  for (const value of values) {
+  for (let i = 0; i < values.length; i++) {
+    const value = values[i];
     if (value == null) continue;
+    b.currentRow = rows ? rows[i] : i;
     const bytes = value as Uint8Array;
     const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
     readGeometry(new WkbCursor(view), b);

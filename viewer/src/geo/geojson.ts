@@ -18,18 +18,31 @@ type Ring = Position[];
 // xy pair per feature. Paths and polygons hold a positions array plus a
 // startIndices array marking where each path/ring begins (last entry is the total
 // vertex count), the exact shape deck.gl's binary attribute path expects.
+//
+// `rowIds` is a parallel provenance array with one entry per rendered primitive,
+// aligned with deck.gl's per-primitive pick index: for points, one per xy pair;
+// for paths and polygons, one per `startIndices` span (so `rowIds.length` equals
+// `startIndices.length - 1`); for holed polygons, one per polygon. Each entry is
+// the absolute parquet row the primitive came from, so a picked geometry resolves
+// to its source row and the click popup can fetch that row's attribute columns. A
+// MultiPolygon that explodes into several polygon entries repeats its row in each.
+// Stored as Uint32, so provenance assumes fewer than 2^32 rows, far above the
+// tens of millions this reader targets.
 export interface FlatPoints {
   positions: Float64Array;
+  rowIds: Uint32Array;
 }
 
 export interface FlatPaths {
   positions: Float64Array;
   startIndices: Uint32Array;
+  rowIds: Uint32Array;
 }
 
 export interface FlatPolygons {
   positions: Float64Array;
   startIndices: Uint32Array;
+  rowIds: Uint32Array;
 }
 
 // Polygons with holes, on the flat binary path. All rings of all holed polygons
@@ -44,6 +57,7 @@ export interface FlatHoledPolygons {
   positions: Float64Array;
   polygonStartIndices: Uint32Array;
   ringStartIndices: Uint32Array;
+  rowIds: Uint32Array;
 }
 
 export interface FlatGeometries {
@@ -89,15 +103,16 @@ export class Float64Builder {
   }
 }
 
-// Growable Uint32 buffer for the startIndices arrays, seeded with a leading 0 so
-// consumers can read [i, i+1) spans directly.
+// Growable Uint32 buffer. The startIndices arrays seed a leading 0 so consumers
+// can read [i, i+1) spans directly; the rowIds arrays pass seedZero false, since
+// they are a plain one-entry-per-primitive list with no span semantics.
 export class Uint32Builder {
   private buf: Uint32Array;
   private len = 0;
 
-  constructor(initial = 256) {
+  constructor(initial = 256, seedZero = true) {
     this.buf = new Uint32Array(initial);
-    this.buf[this.len++] = 0;
+    if (seedZero) this.buf[this.len++] = 0;
   }
 
   push(value: number): void {
@@ -125,16 +140,25 @@ export class Uint32Builder {
 // single post-pass over the finished arrays in finalizeBuckets.
 export class FlatBuilders {
   readonly pointPos = new Float64Builder();
+  readonly pointRows = new Uint32Builder(256, false);
   readonly pathPos = new Float64Builder();
   readonly pathStarts = new Uint32Builder();
+  readonly pathRows = new Uint32Builder(256, false);
   pathVertices = 0;
   readonly polyPos = new Float64Builder();
   readonly polyStarts = new Uint32Builder();
+  readonly polyRows = new Uint32Builder(256, false);
   polyVertices = 0;
   readonly holedPos = new Float64Builder();
   readonly holedPolyStarts = new Uint32Builder();
   readonly holedRingStarts = new Uint32Builder();
+  readonly holedRows = new Uint32Builder(256, false);
   holedVertices = 0;
+  // The absolute parquet row of the value currently being flattened. The caller
+  // sets this before each value; every primitive committed for that value stamps
+  // it into the matching rowIds builder. See flattenGeoJson below and
+  // wkb-flatten.ts. Left 0 when the caller supplies no rows.
+  currentRow = 0;
 }
 
 // Finish every builder into typed arrays, then reproject all four positions
@@ -142,13 +166,22 @@ export class FlatBuilders {
 // so caching reprojected buckets keeps cache hits zero-work.
 export function finalizeBuckets(b: FlatBuilders, transform?: CoordTransform | null): FlatGeometries {
   const flat: FlatGeometries = {
-    points: { positions: b.pointPos.finish() },
-    paths: { positions: b.pathPos.finish(), startIndices: b.pathStarts.finish() },
-    polygons: { positions: b.polyPos.finish(), startIndices: b.polyStarts.finish() },
+    points: { positions: b.pointPos.finish(), rowIds: b.pointRows.finish() },
+    paths: {
+      positions: b.pathPos.finish(),
+      startIndices: b.pathStarts.finish(),
+      rowIds: b.pathRows.finish(),
+    },
+    polygons: {
+      positions: b.polyPos.finish(),
+      startIndices: b.polyStarts.finish(),
+      rowIds: b.polyRows.finish(),
+    },
     holedPolygons: {
       positions: b.holedPos.finish(),
       polygonStartIndices: b.holedPolyStarts.finish(),
       ringStartIndices: b.holedRingStarts.finish(),
+      rowIds: b.holedRows.finish(),
     },
   };
   if (transform) {
@@ -163,11 +196,13 @@ export function finalizeBuckets(b: FlatBuilders, transform?: CoordTransform | nu
 export function flattenGeoJson(
   geometries: unknown[],
   transform?: CoordTransform | null,
+  rows?: ArrayLike<number>,
 ): FlatGeometries {
   const b = new FlatBuilders();
 
   const addPoint = (p: Position): void => {
     b.pointPos.push2(p[0], p[1]);
+    b.pointRows.push(b.currentRow);
   };
 
   const addPath = (line: Position[]): void => {
@@ -175,6 +210,7 @@ export function flattenGeoJson(
     for (const p of line) b.pathPos.push2(p[0], p[1]);
     b.pathVertices += line.length;
     b.pathStarts.push(b.pathVertices);
+    b.pathRows.push(b.currentRow);
   };
 
   // Push a single exterior ring into the hole-free polygon buckets.
@@ -183,6 +219,7 @@ export function flattenGeoJson(
     for (const p of ring) b.polyPos.push2(p[0], p[1]);
     b.polyVertices += ring.length;
     b.polyStarts.push(b.polyVertices);
+    b.polyRows.push(b.currentRow);
   };
 
   // Push a holed polygon (exterior plus interior rings) into the flat holed
@@ -197,7 +234,10 @@ export function flattenGeoJson(
       b.holedRingStarts.push(b.holedVertices);
       ringsAdded += 1;
     }
-    if (ringsAdded > 0) b.holedPolyStarts.push(b.holedVertices);
+    if (ringsAdded > 0) {
+      b.holedPolyStarts.push(b.holedVertices);
+      b.holedRows.push(b.currentRow);
+    }
   };
 
   // Route one polygon (an array of rings) to the binary path if hole-free, or to
@@ -238,7 +278,12 @@ export function flattenGeoJson(
     }
   };
 
-  for (const raw of geometries) visit(raw);
+  for (let i = 0; i < geometries.length; i++) {
+    // Stamp this value's absolute row (or its position when no rows are given) so
+    // every primitive it produces carries the same provenance.
+    b.currentRow = rows ? rows[i] : i;
+    visit(geometries[i]);
+  }
 
   return finalizeBuckets(b, transform);
 }
@@ -277,21 +322,43 @@ function concatStartIndices(buckets: { positions: Float64Array; startIndices: Ui
   return out;
 }
 
+// Concatenate several per-primitive rowIds arrays. Unlike startIndices these are
+// absolute parquet rows, not vertex offsets, so a plain concatenation keeps every
+// primitive aligned with its merged startIndices span.
+function concatRowIds(arrays: Uint32Array[]): Uint32Array {
+  let total = 0;
+  for (const a of arrays) total += a.length;
+  const out = new Uint32Array(total);
+  let offset = 0;
+  for (const a of arrays) {
+    out.set(a, offset);
+    offset += a.length;
+  }
+  return out;
+}
+
 // Merge several per-row-group FlatGeometries into one combined set of buckets, so
 // a settled view can be painted with one layer per kind instead of one per batch.
 // The typed arrays are concatenated and every startIndices array rebased against
-// its bucket's shared positions. An empty list yields empty buckets.
+// its bucket's shared positions. The rowIds arrays are concatenated in the same
+// order so a pick into the merged bucket still resolves to its source row. An
+// empty list yields empty buckets.
 export function mergeFlatGeometries(list: FlatGeometries[]): FlatGeometries {
   const holed = list.map((f) => f.holedPolygons);
   return {
-    points: { positions: concatPositions(list.map((f) => f.points.positions)) },
+    points: {
+      positions: concatPositions(list.map((f) => f.points.positions)),
+      rowIds: concatRowIds(list.map((f) => f.points.rowIds)),
+    },
     paths: {
       positions: concatPositions(list.map((f) => f.paths.positions)),
       startIndices: concatStartIndices(list.map((f) => f.paths)),
+      rowIds: concatRowIds(list.map((f) => f.paths.rowIds)),
     },
     polygons: {
       positions: concatPositions(list.map((f) => f.polygons.positions)),
       startIndices: concatStartIndices(list.map((f) => f.polygons)),
+      rowIds: concatRowIds(list.map((f) => f.polygons.rowIds)),
     },
     holedPolygons: {
       positions: concatPositions(holed.map((h) => h.positions)),
@@ -301,6 +368,7 @@ export function mergeFlatGeometries(list: FlatGeometries[]): FlatGeometries {
       ringStartIndices: concatStartIndices(
         holed.map((h) => ({ positions: h.positions, startIndices: h.ringStartIndices })),
       ),
+      rowIds: concatRowIds(holed.map((h) => h.rowIds)),
     },
   };
 }

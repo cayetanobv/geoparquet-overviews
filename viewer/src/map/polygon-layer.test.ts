@@ -40,6 +40,7 @@ describe('buildHoledPolygonLayer fill layer props', () => {
       positions: SQUARE_WITH_HOLE_POSITIONS,
       polygonStartIndices: new Uint32Array([0, 8]),
       ringStartIndices: new Uint32Array([0, 4, 8]),
+      rowIds: new Uint32Array([0]),
     };
     const layers = buildHoledPolygonLayer('test-holed', holed);
     const fillLayer = layers[0];
