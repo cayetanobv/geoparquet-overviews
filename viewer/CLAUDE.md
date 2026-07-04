@@ -23,7 +23,11 @@ Node >= 24, pnpm 11.9.0.
 ## Data flow
 
 - `src/ui/app-root.ts` drives everything, debounced moveend fetches, a
-  superseding token per view, progressive paint per row group.
+  superseding token per view, progressive paint per row group. It also mirrors
+  the loaded file into the `url` query parameter and the live camera into `x`
+  (lng), `y` (lat), `z` (zoom) via `replaceState` on every settle, and restores
+  a deep-linked camera on first open through `initialView` (in `data/presets.ts`,
+  applied with `MapView.jumpTo` instead of the default extent fit).
 - `src/data/manifest.ts` fetches the hosted `versions.json` catalog
   (`fetchManifest`, `MANIFEST_URL`), parses it (`parseManifest`), derives a
   version's preset list (`presetsForVersion`), and maps a dataset across

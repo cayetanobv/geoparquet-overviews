@@ -89,6 +89,13 @@ address, anything else falls back to the default preset. The address bar
 mirrors the loaded file, so it is always a shareable link and a refresh
 reopens the same file.
 
+The map camera is mirrored too, as `x`, `y`, and `z` query parameters, x
+longitude, y latitude, z zoom, for example
+`?url=https://host/path/file.parquet&x=139.77&y=35.68&z=12.5`. The address bar
+updates on every pan and zoom, and opening a link with all three restores that
+exact view instead of fitting the file extent. A partial or malformed camera is
+ignored and the viewer fits the extent as usual.
+
 ## CRS support
 
 Projected files reproject to lon and lat in the browser via proj4. The known
