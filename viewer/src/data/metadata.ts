@@ -127,6 +127,31 @@ function findColumnStatistics(rowGroup: RawRowGroup, path: string[]): RawStatist
   return column?.meta_data.statistics ?? null;
 }
 
+// True when a native GeospatialStatistics bbox carries finite, correctly
+// ordered bounds. An all-null column chunk (e.g. the finest band's
+// `geom_overview`, which is null for every row in that band) still gets
+// `geospatial_statistics` from the writer, but with null bounds, so this
+// guard rejects it and lets the caller fall through to the next candidate.
+function isUsableGeoStatsBbox(bbox: RawGeoStatsBbox | undefined): bbox is RawGeoStatsBbox {
+  return (
+    !!bbox &&
+    Number.isFinite(bbox.xmin) &&
+    Number.isFinite(bbox.ymin) &&
+    Number.isFinite(bbox.xmax) &&
+    Number.isFinite(bbox.ymax) &&
+    bbox.xmin <= bbox.xmax &&
+    bbox.ymin <= bbox.ymax
+  );
+}
+
+// The native GeospatialStatistics bbox of one column chunk, or null when the
+// column is absent or its stats are unusable (see isUsableGeoStatsBbox).
+function findGeospatialStatsBbox(rowGroup: RawRowGroup, path: string[]): RawGeoStatsBbox | null {
+  const column = rowGroup.columns.find((c) => pathsEqual(c.meta_data.path_in_schema, path));
+  const bbox = column?.meta_data.geospatial_statistics?.bbox;
+  return isUsableGeoStatsBbox(bbox) ? bbox : null;
+}
+
 // The GeoJSON geometry types the viewer can flatten and draw. Any type not in
 // this set (or a declared-but-empty type list) means the file carries nothing
 // renderable, which the UI surfaces as a notice.
@@ -245,20 +270,24 @@ export function readGeoParquetMetadata(rawMeta: FileMetaData): GeoParquetMetadat
     }
     if (!bbox) {
       // Profile B files (converter --no-bbox) carry no physical covering
-      // column. Fall back to the native GeospatialStatistics on the primary
-      // geometry column chunk, hyparquet exposes it as `geospatial_statistics`
-      // on meta_data. Same reprojection as the covering path so pruning is
-      // identical either way.
+      // column. Fall back to native GeospatialStatistics, which hyparquet
+      // exposes as `geospatial_statistics` on meta_data. At coarse zoom the
+      // viewer paints the grid-snapped `geom_overview` column, not the exact
+      // `geometry` column, so prefer the overview column's own native stats
+      // here: they are computed from the overview geometry actually written,
+      // so (unlike the exact column's stats) they need no separate padding
+      // for the grid snap (see SPEC.md's Profile B paragraph). The finest
+      // band's `geom_overview` chunk is all null, so it carries no usable
+      // bounds (isUsableGeoStatsBbox rejects it) and this falls through to
+      // the primary geometry column's stats, which is correct since the
+      // finest band renders exact geometry anyway. Same reprojection as the
+      // covering path so pruning is identical either way.
       const primary = (geo?.primary_column as string) ?? 'geometry';
-      const geomChunk = rowGroup.columns.find((c) => pathsEqual(c.meta_data.path_in_schema, [primary]));
-      const gs = geomChunk?.meta_data.geospatial_statistics?.bbox;
-      if (
-        gs &&
-        Number.isFinite(gs.xmin) &&
-        Number.isFinite(gs.ymin) &&
-        Number.isFinite(gs.xmax) &&
-        Number.isFinite(gs.ymax)
-      ) {
+      const overviewColumn = overviewsInfo?.overviewColumn ?? null;
+      const gs =
+        (overviewColumn ? findGeospatialStatsBbox(rowGroup, [overviewColumn]) : null) ??
+        findGeospatialStatsBbox(rowGroup, [primary]);
+      if (gs) {
         bbox = reprojectBbox({ xmin: gs.xmin, ymin: gs.ymin, xmax: gs.xmax, ymax: gs.ymax }, projection.transform);
       }
     }
