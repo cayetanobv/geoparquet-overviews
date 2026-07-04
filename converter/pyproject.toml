@@ -1,6 +1,6 @@
 [project]
 name = "geoparquet-overviews"
-version = "0.1.0"
+version = "0.2.0"
 description = "Convert any GeoParquet into the overviews layout, one file a browser can preview and a SQL engine can read."
 readme = "README.md"
 requires-python = ">=3.12"
