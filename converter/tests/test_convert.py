@@ -93,12 +93,37 @@ def test_convert_writes_overviews_footer(tmp_path):
     assert b"geo" in meta
     assert b"overviews" in meta
     ov = json.loads(meta[b"overviews"])
-    assert ov["version"] == "0.1.0"
+    assert ov["version"] == "0.2.0"
     assert ov["overview_column"] == "geom_overview"
     # Levels are ordered and the last level ends at the last row group.
     ends = [lvl["row_group_end"] for lvl in ov["levels"]]
     assert ends == sorted(ends)
     assert ends[-1] == summary["row_groups"] - 1
+
+
+def test_levels_carry_bytes_and_extent(tmp_path):
+    src = tmp_path / "src.parquet"
+    dst = tmp_path / "dst.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(dst), ConvertOptions(bands=2))
+    pf = pq.ParquetFile(dst)
+    import json as _json
+    ov = _json.loads(pf.metadata.metadata[b"overviews"])
+    assert ov["version"] == "0.2.0"
+    levels = ov["levels"]
+    prev_end = 4  # after the PAR1 magic
+    for lvl in levels:
+        start, end = lvl["bytes"]
+        assert start >= prev_end and end > start
+        prev_end = end
+        ext = lvl["extent"]
+        assert len(ext) == 4 and ext[0] <= ext[2] and ext[1] <= ext[3]
+    # The ranges tile the data section, level 0 starts at the first row group.
+    assert levels[0]["bytes"][0] == 4
+    # And the end of the last level matches the last row group boundary, which
+    # must sit before the footer.
+    import os
+    assert levels[-1]["bytes"][1] < os.path.getsize(dst)
 
 
 def test_row_count_and_geometry_preserved(tmp_path):

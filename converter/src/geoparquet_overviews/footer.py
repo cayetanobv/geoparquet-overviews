@@ -85,8 +85,9 @@ def overviews_meta(
     has_overview: bool,
     importance: str = "area_desc",
     overview_method: str = "simplify_snap",
+    version: str = "0.2.0",
 ) -> str:
-    """The additive `overviews` footer block, draft 0.1.0.
+    """The additive `overviews` footer block, draft 0.2.0.
 
     `levels` is computed from the real row group layout, never hand authored.
     Each level maps a band to the index of its last row group, the coarsest
@@ -105,7 +106,7 @@ def overviews_meta(
     the banding itself is the level of detail and no overview column exists.
     """
     block: dict = {
-        "version": "0.1.0",
+        "version": version,
         "spatial_key": spatial_key,
         "importance": importance,
         "covering": COVERING,

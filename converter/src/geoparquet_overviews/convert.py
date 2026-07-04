@@ -791,6 +791,18 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     bounds[coarse, 2] += pad
     bounds[coarse, 3] += pad
 
+    # Per-band extents for `levels[].extent`, computed from the padded bounds so
+    # they enclose the overview geometry too. A band of only null geometries
+    # gets a null extent.
+    band_extents: dict[int, list[float] | None] = {}
+    for b in range(bands):
+        m = valid & (band == b)
+        band_extents[b] = (
+            [float(np.min(bounds[m, 0])), float(np.min(bounds[m, 1])),
+             float(np.max(bounds[m, 2])), float(np.max(bounds[m, 3]))]
+            if m.any() else None
+        )
+
     gtype = _wkb_extension_type(opts.native_geo, crs if crs_present else None, crs_present)
 
     def _geom_array(values: np.ndarray) -> pa.Array:
@@ -803,14 +815,17 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     if has_overview:
         table = table.append_column("geom_overview", _geom_array(overview_wkb))
 
-    levels = []
+    base_levels = []
     prev_zoom = -1
     for b in sorted(band_rg_end):
         gsd = band_tol.get(b, 0.0) if b < bands - 1 else 0.0
         max_zoom = _zoom_for_gsd(gsd, world) if b < bands - 1 else _FINE_MAX_ZOOM
         max_zoom = max(max_zoom, prev_zoom + 1)  # keep the ladder strictly increasing
         prev_zoom = max_zoom
-        levels.append({"level": b, "row_group_end": band_rg_end[b], "max_zoom": max_zoom, "gsd": gsd})
+        base_levels.append({
+            "level": b, "row_group_end": band_rg_end[b],
+            "max_zoom": max_zoom, "gsd": gsd, "extent": band_extents.get(b),
+        })
 
     type_names = _geometry_type_names(geoms)
     # Recompute the overview column's own types from its WKB, since simplify can
@@ -824,11 +839,25 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
             source_column=source_column,
             overview_geometry_types=overview_type_names,
         ),
-        "overviews": footer.overviews_meta(
-            "hilbert", levels, has_overview,
-            importance=importance, overview_method=overview_method,
-        ),
     }
+
+    levels: list[dict] = []
+
+    def _late_kv(rg_ranges: list[tuple[int, int]]) -> dict[str, str]:
+        # Stamp each level with the byte range of its row-group run, known only
+        # after the row groups are written. Ranges are [start, end) file offsets.
+        prev_end = -1
+        for lvl in base_levels:
+            first_rg = prev_end + 1
+            lvl["bytes"] = [rg_ranges[first_rg][0], rg_ranges[lvl["row_group_end"]][1]]
+            prev_end = lvl["row_group_end"]
+        levels.extend(base_levels)
+        return {
+            "overviews": footer.overviews_meta(
+                "hilbert", base_levels, has_overview,
+                importance=importance, overview_method=overview_method,
+            ),
+        }
 
     # C16, verify the plan covers every row before we write anything, not after.
     if sum(plan) != table.num_rows:
@@ -836,7 +865,7 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
 
     t = time.perf_counter()
     log.info("writing %s with zstd, page index, byte-stream-split doubles, declared sorting", dst)
-    _write(table, dst, plan, kv, opts)
+    _write(table, dst, plan, kv, opts, late_kv=_late_kv)
     log.info("wrote in %.1fs", time.perf_counter() - t)
 
     # The preview payoff, what a lowest-zoom read touches versus a full scan.
@@ -904,10 +933,21 @@ def _geometry_type_names_from_wkb(wkb: np.ndarray) -> list[str]:
     return _geometry_type_names(shapely.from_wkb(present))
 
 
-def _write(table: pa.Table, dst: str, plan: list[int], kv: dict[str, str], opts: ConvertOptions) -> None:
+def _write(
+    table: pa.Table, dst: str, plan: list[int], kv: dict[str, str],
+    opts: ConvertOptions, late_kv=None,
+) -> None:
     """Write with everything the DuckDB writer cannot do, the Page Index,
     BYTE_STREAM_SPLIT on doubles, declared sorting_columns, adaptive row groups,
-    and the exact footer key values."""
+    and the exact footer key values.
+
+    `late_kv`, when given, is called once all row groups are written with the
+    `(start, end)` byte range of each row group in write order. It returns
+    footer keys, such as `overviews`, whose per-level byte ranges are only
+    knowable after the bytes have actually landed. Those keys are added via
+    `add_key_value_metadata` right before close, so they are the only source
+    of that key, no duplicate stale copy survives from the schema metadata.
+    """
     # Exact-key filter, so unrelated keys like `geoarrow` or a user's own
     # `geometry_source` survive instead of being stripped by a `geo` prefix.
     reserved = {b"geo", b"overviews"}
@@ -946,20 +986,26 @@ def _write(table: pa.Table, dst: str, plan: list[int], kv: dict[str, str], opts:
         else None
     )
 
-    writer = pq.ParquetWriter(
-        dst,
-        table.schema,
-        compression="zstd",
-        compression_level=opts.compression_level,
-        write_page_index=True,
-        data_page_size=opts.page_size_kb * 1024,
-        use_dictionary=dict_cols or False,
-        use_byte_stream_split=byte_split,
-        write_statistics=stats_cols,
-        sorting_columns=sorting,
-    )
-    offset = 0
-    for rows in plan:
-        writer.write_table(table.slice(offset, rows), row_group_size=rows)
-        offset += rows
-    writer.close()
+    with open(dst, "wb") as sink:
+        writer = pq.ParquetWriter(
+            sink,
+            table.schema,
+            compression="zstd",
+            compression_level=opts.compression_level,
+            write_page_index=True,
+            data_page_size=opts.page_size_kb * 1024,
+            use_dictionary=dict_cols or False,
+            use_byte_stream_split=byte_split,
+            write_statistics=stats_cols,
+            sorting_columns=sorting,
+        )
+        rg_ranges: list[tuple[int, int]] = []
+        offset = 0
+        for rows in plan:
+            start = sink.tell()
+            writer.write_table(table.slice(offset, rows), row_group_size=rows)
+            rg_ranges.append((start, sink.tell()))
+            offset += rows
+        if late_kv is not None:
+            writer.add_key_value_metadata(late_kv(rg_ranges))
+        writer.close()
