@@ -820,3 +820,57 @@ def test_no_bbox_profile(tmp_path):
 def test_no_bbox_requires_native_geo(tmp_path):
     with pytest.raises(ValueError, match="native"):
         convert("x", "y", ConvertOptions(bbox=False, native_geo=False))
+
+
+def test_reconvert_with_no_bbox_drops_stale_covering(tmp_path):
+    """A prior converter output already carries a `covering` on `geometry`.
+    Re-converting it with `--no-bbox` (Profile B) must not leak that covering
+    forward, the output has no `bbox` column for it to point at."""
+    src = tmp_path / "src.parquet"
+    with_bbox = tmp_path / "with_bbox.parquet"
+    no_bbox = tmp_path / "no_bbox.parquet"
+    pq.write_table(_poly_table(), src)
+
+    # Profile A: a normal output, which carries a covering.
+    convert(str(src), str(with_bbox), ConvertOptions(bands=2))
+    geo_with_bbox = json.loads(pq.read_metadata(with_bbox).metadata[b"geo"])
+    assert "covering" in geo_with_bbox["columns"]["geometry"]
+
+    # Profile B reconversion of that output must strip the inherited covering.
+    convert(str(with_bbox), str(no_bbox), ConvertOptions(bands=2, bbox=False))
+    pf = pq.ParquetFile(no_bbox)
+    assert "bbox" not in pf.schema_arrow.names
+    geo = json.loads(pf.metadata.metadata[b"geo"])
+    assert "covering" not in geo["columns"]["geometry"]
+    ov = json.loads(pf.metadata.metadata[b"overviews"])
+    assert "covering" not in ov
+    # Native geospatial statistics remain the pruning surface.
+    names = [pf.metadata.row_group(0).column(i).path_in_schema for i in range(pf.metadata.num_columns)]
+    col = pf.metadata.row_group(0).column(names.index("geometry"))
+    assert col.is_geo_stats_set
+
+
+def test_reconvert_with_bbox_has_valid_covering(tmp_path):
+    """Re-converting a Profile B output with `--bbox` (Profile A) must produce
+    a valid covering that points at a `bbox` column actually present in the
+    output schema, no dangling reference."""
+    src = tmp_path / "src.parquet"
+    no_bbox = tmp_path / "no_bbox.parquet"
+    with_bbox = tmp_path / "with_bbox.parquet"
+    pq.write_table(_poly_table(), src)
+
+    convert(str(src), str(no_bbox), ConvertOptions(bands=2, bbox=False))
+    convert(str(no_bbox), str(with_bbox), ConvertOptions(bands=2, bbox=True))
+
+    pf = pq.ParquetFile(with_bbox)
+    assert "bbox" in pf.schema_arrow.names
+    geo = json.loads(pf.metadata.metadata[b"geo"])
+    covering = geo["columns"]["geometry"]["covering"]
+    assert covering == {
+        "bbox": {
+            "xmin": ["bbox", "xmin"],
+            "ymin": ["bbox", "ymin"],
+            "xmax": ["bbox", "xmax"],
+            "ymax": ["bbox", "ymax"],
+        }
+    }

@@ -75,6 +75,11 @@ def geo_meta(
     primary = column(geometry_types)
     if covering:
         primary["covering"] = COVERING
+    else:
+        # Strip any covering inherited from a source column that was itself a
+        # converter output with a bbox column, Profile B has no bbox column
+        # for it to point at.
+        primary.pop("covering", None)
     columns = {"geometry": primary}
     if has_overview:
         ov = column(overview_geometry_types if overview_geometry_types is not None else geometry_types)
