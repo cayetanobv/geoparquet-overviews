@@ -331,15 +331,42 @@ the table.
    today, pyarrow 21+ writes native GEOMETRY with automatic statistics
    alongside the `geo` key, and hyparquet 1.19+ reads both the type and the
    statistics (section 4).
-4. Serve the ecosystem compatibility goal through derivation, not in file
-   tiles. gpq-tiles already exports PMTiles from overview bands. The two
-   projects together cover canonical file, fast converter, tile export, and
-   browser viewer.
-5. Consider adopting his open ideas that this draft also wanted, per level
-   byte ranges and extents in `levels[]`, so a reader can price a prefix read
-   before issuing it.
+4. The end goal is fixed and PMTiles compatibility is not it. The goal is
+   that next generation GeoParquet is by itself enough to visualize big data
+   the way PMTiles does, one canonical file, range requests, no derived tile
+   artifact required. gpq-tiles' PMTiles export exists for people who want
+   tiles and that is fine, but the merged draft must not assume tiles are
+   the rendering path, and this project does not take on tile export as a
+   goal.
+5. Close the remaining gap with PMTiles inside the file, not beside it. The
+   levers, in priority order. Per level byte ranges and extents in
+   `levels[]` so a reader prices a prefix read before issuing it (both
+   drafts already wanted this). Page index tuning through `--page-size-kb`
+   so page pruning approaches tile granularity. Worker decode in the viewer
+   (already on the roadmap) so decode cost stays off the main thread. A
+   packaged reader (the viewer's data layer as a library) so MapLibre and
+   deck.gl users get GeoParquet overviews as easily as the PMTiles plugin.
+6. Dual write GeoParquet 1.1 plus 2.0 native types with statistics is a
+   commitment for 0.2.0 regardless of how the alignment conversation goes.
+   The stack is verified ready (section 4).
 
 ## 7. Recommended positions for the alignment call
+
+Red lines first, the negotiable items after. Names, key spelling, and field
+mapping are all tradeable. The following are not.
+
+- The file itself must remain sufficient for direct visualization over range
+  requests. The merged draft must not relegate rendering to a derived
+  PMTiles artifact or treat the in file path as second class.
+- Partitioning mode with the optional `geom_overview` column must be a first
+  class citizen of the merged draft, since it is the only shape that serves
+  both SQL and rendering from one copy of the data.
+- The covering bbox column plus page index must stay expressible (the
+  Profile A default of section 4), because it is the only sub row group
+  pruning mechanism the format offers and therefore the core of the direct
+  visualization story.
+- Dual write GeoParquet 1.1 plus 2.0 native types must be compatible with
+  whatever metadata shape is agreed. This project ships it either way.
 
 1. Key name. Concede `geo:overviews`. Namespaced, standards friendly, cheap
    to give, and goodwill for the points that matter more.
