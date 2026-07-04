@@ -83,6 +83,18 @@ pnpm dev                                            # vite, port 5173+
   for lines, an attribute column or grid thinning for points, and writes the
   resulting `overview_method` into the footer. The viewer renders points,
   lines, collections, and polygon holes.
+- Draft 0.2.0. The converter dual writes native Parquet GEOMETRY logical
+  types on `geometry` and `geom_overview` by default (`--native-geo`, off
+  with `--no-native-geo`), so pyarrow computes per-row-group
+  GeospatialStatistics on both columns while the `geo` footer key stays
+  WKB-encoded at version `1.1.0`. The `overviews` key itself is now version
+  `0.2.0` and each entry in `levels[]` gained `extent`, the band's padded
+  bounding box, and `bytes`, the `[start, end)` file byte range of the
+  band's own row groups. There are two writer profiles, Profile A
+  (`--bbox`, default) writes the physical `bbox` covering column and Page
+  Index as before, Profile B (`--no-bbox`) omits them and relies solely on
+  native GeospatialStatistics for row-group pruning, with no page-level
+  pruning at all since Parquet has no page-level geospatial statistics.
 - Viewer supports click-to-inspect. Each rendered primitive carries a
   per-primitive `rowIds` provenance array back to its absolute parquet row,
   so a click resolves the feature, reads only that row's non-geometry columns
