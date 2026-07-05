@@ -23,7 +23,13 @@ Node >= 24, pnpm 11.9.0.
 ## Data flow
 
 - `src/ui/app-root.ts` drives everything, debounced moveend fetches, a
-  superseding token per view, progressive paint per row group. It also mirrors
+  superseding token per view, progressive paint per row group. Each settled
+  view records a `planSignature` (`data/plan-signature.ts`, the column plus the
+  resolved per-group row ranges), so an in-place pan that resolves to the same
+  signature short circuits before any teardown and leaves the layers on screen,
+  no re-decode and no GPU re-upload. A superseded fetch no longer drains before
+  the next starts, the token gate alone protects paint (a stale token no-ops
+  every paint into shared state). It also mirrors
   the loaded file into the `url` query parameter and the live camera into `x`
   (lng), `y` (lat), `z` (zoom) via `replaceState` on every settle, and restores
   a deep-linked camera on first open through `initialView` (in `data/presets.ts`,
@@ -59,16 +65,21 @@ Node >= 24, pnpm 11.9.0.
 - `src/data/rowgroups.ts` reads through hyparquet's columnar path,
   `parquetRead` with `onChunk` and an identity geometry parser
   (`RAW_WKB_PARSERS`), so geometry arrives as zero-copy WKB Uint8Array views.
-  Up to 6 groups read concurrently, onBatch paints strictly serially.
+  Up to 16 groups read concurrently, onBatch paints strictly serially.
 - `src/geo/wkb-flatten.ts` scans WKB with a DataView straight into flat
   typed-array buckets, no GeoJSON intermediate. `src/geo/geojson.ts` keeps
   the GeoJSON flattener only as a fallback for already-decoded values.
 - `src/geo/crs.ts` reprojects projected files to lon and lat with proj4,
   in place on the flat buffers. Known defs live in `PROJ_DEFS`, add EPSG
   codes there.
-- `src/data/flat-cache.ts` LRU-caches decoded flat buckets per
-  (column, row group, row range), 192 MB budget. `src/data/byte-cache.ts`
-  and `file-cache.ts` cache bytes and file handles one level down.
+- `src/data/flat-cache.ts` LRU-caches decoded flat buckets, 192 MB budget. A
+  whole-group read keys on `(column, group, 'full')`. A page-pruned group keys
+  each kept page on `(column, group, pageRowStart-pageRowEnd)` so panning inside
+  one wide group reuses the pages it already decoded instead of re-decoding the
+  whole kept span as the viewport shifts. `src/data/byte-cache.ts` and
+  `file-cache.ts` cache bytes and file handles one level down. `file-cache.ts`
+  also memoizes each group's decoded page index, so pruning a group a second
+  time is free.
 - `src/map/polygon-layer.ts` and `map-view.ts` build deck.gl layers.
   Batches paint progressively, then each settled view consolidates to
   single-digit layer counts. The fill, line, and point layers are pickable
@@ -147,7 +158,14 @@ Node >= 24, pnpm 11.9.0.
 
 ## Open work
 
-Phase 3 of the performance plan remains open, worker decode. Move the
+The pan render-path performance pass has landed, the plan-signature short
+circuit, small-view merge skip plus merged-layer reuse, the per-page flat
+cache, concurrent first-view page-index reads, no fetch draining, and read
+concurrency raised to 16 for HTTP/2. The design and plan live in
+`docs/superpowers/`. Worker decode is a separate, still-open effort, described
+next.
+
+Move the
 read-decode-flatten chain into a Web Worker with transferable ArrayBuffers,
 upload on the main thread. Known design tensions, transferring detaches
 buffers which conflicts with the byte cache's aliasing contract (see the

@@ -21,13 +21,15 @@ import {
   type FileFacts,
 } from '../data/metadata';
 import { readColumnProgressive, getFileForUrl, type RowGroupRange } from '../data/rowgroups';
+import type { SchemaElement } from 'hyparquet';
 import { readRowAttributes } from '../data/feature-detail';
 import { featureLoadingHtml, featureAttributesHtml, featureErrorHtml } from './feature-popup';
-import type { PickingInfo } from '@deck.gl/core';
-import { pageRangesForRowGroup, mergePageRanges } from '../data/pageindex';
+import type { Layer, PickingInfo } from '@deck.gl/core';
+import { pageRangesForRowGroup, mergePageRanges, keptPageRanges, type PageRange } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
 import { viewFetchKey } from './fetch-key';
+import { planSignature } from '../data/plan-signature';
 import { initialUrl, initialView, type CameraView } from '../data/presets';
 import { MapView } from '../map/map-view';
 import { buildLayers } from '../map/polygon-layer';
@@ -37,6 +39,13 @@ import type { VizWaterfall } from '../viz/waterfall';
 import type { LoadStats, LoadSummary } from '../viz/stats';
 
 installFetchInstrumentation();
+
+// Below this many batches the per-batch layers already on screen are few enough
+// that collapsing them into one merged layer set is not worth re-allocating and
+// re-uploading every coordinate a second time. Above it, the draw-call and
+// layer-diff overhead of many batch layers wins, so the merge pays for itself.
+// Tunable, pinned empirically against the hosted datasets.
+const MERGE_LAYER_THRESHOLD = 8;
 
 export class AppRoot extends LitElement {
   static properties = {
@@ -91,18 +100,33 @@ export class AppRoot extends LitElement {
   // Coalesce bursts of moveend (e.g. a zoom that settles then an immediate pan)
   // into a single read, so fast camera moves do not each kick off a fetch.
   private fetchTimer: ReturnType<typeof setTimeout> | null = null;
-  // Fetches are serialized (one wasm read at a time) and superseded by token,
-  // so a pan mid-read cancels the stale read at the next row-group boundary and
-  // never paints stale results.
+  // Each fetch carries this token. A newer fetch bumps it and starts right
+  // away, superseding any fetch still in flight, so a pan mid-read cancels
+  // the stale read at the next row-group boundary and never paints stale
+  // results.
   private fetchToken = 0;
   // Bumped on every loadUrl so a load in flight for a superseded file does not
   // reset shared state (busy, the active URL) under a newer load.
   private loadToken = 0;
-  private fetchChain: Promise<void> = Promise.resolve();
   // Dedupe key of the last view fetched, so an idle moveend (no real camera
   // change) does not refetch the identical bbox and band.
   private lastFetchKey: string | null = null;
   private strategy: LayoutStrategy | null = null;
+  // File-invariant scratch, recomputed once per loadUrl and reused on every pan
+  // so the per-fetch path does not rebuild them. rowOffsets[i] is the absolute
+  // first row of row group i.
+  private rowOffsets: number[] = [];
+  private schemaLookupCache: Map<string, SchemaElement> | null = null;
+  // Signature and url of the plan currently painted on screen. A fetch that
+  // resolves to the same signature leaves the layers untouched.
+  private renderedPlanSig: string | null = null;
+  private renderedUrl: string | null = null;
+  // Built merged layer sets keyed by plan signature, together with the merged
+  // buckets they were built from, so a recurring large view reuses the same
+  // Layer objects by reference (deck.gl skips the GPU re-upload) and resolves
+  // picks against the same merged buckets those layers were built from.
+  // Bounded, dropped on file switch.
+  private mergedLayerCache = new Map<string, { layers: Layer[]; merged: FlatGeometries }>();
   // The flattened buckets currently on the map, keyed by the layer-set id prefix
   // (`rg-batch-N` during progressive load, `rg-merged` once settled). A click
   // resolves `info.layer.id` to a prefix and a geometry kind, then reads the
@@ -506,6 +530,9 @@ export class AppRoot extends LitElement {
     this.pendingWorking = new Set();
     this.flushVizNow(this.fetchToken);
     this.lastFetchKey = null;
+    this.renderedPlanSig = null;
+    this.renderedUrl = null;
+    this.mergedLayerCache.clear();
     this.summary = null;
     this.fileFacts = null;
     this.busy = true;
@@ -523,6 +550,16 @@ export class AppRoot extends LitElement {
       this.metadata = metadata;
       this.attrColumns = attributeColumns(metadata);
       this.strategy = detectLayout(metadata);
+      // Precompute the file-invariant read scaffolding once, so runFetch and
+      // refineToPages do not rebuild it on every pan.
+      const offsets: number[] = [];
+      let acc = 0;
+      for (const rg of metadata.rowGroups) {
+        offsets.push(acc);
+        acc += rg.rowCount;
+      }
+      this.rowOffsets = offsets;
+      this.schemaLookupCache = schemaLookup(metadata.schema);
       await this.strategy.prepare(url);
       this.fileBytes = metadata.rowGroups.reduce((sum, rg) => sum + rg.totalByteSize, 0);
       this.fileFacts = computeFileFacts(metadata, this.fileBytes, isFilePrefetched(url));
@@ -637,12 +674,14 @@ export class AppRoot extends LitElement {
     }
   }
 
-  // Queue a fetch for one area at one zoom. Fetches are serialized on a promise
-  // chain so only one wasm read runs at a time, and each carries a token so a
-  // newer request supersedes an in-flight one instead of racing it.
+  // Queue a fetch for one area at one zoom. Each fetch carries a token, so a
+  // newer request supersedes an in-flight one via the token gate rather than
+  // racing it, every paint checks it before touching shared state and a stale
+  // paint just no-ops. There is no promise chain, a new view starts right away
+  // instead of waiting for the superseded fetch's in-flight reads to drain.
   private fetchAoi(bbox: Bbox, zoom: number): void {
     const token = ++this.fetchToken;
-    this.fetchChain = this.fetchChain.then(() => this.runFetch(bbox, zoom, token));
+    void this.runFetch(bbox, zoom, token);
   }
 
   // Fetch and render one area at one zoom. The zoom picks the overview level
@@ -662,15 +701,6 @@ export class AppRoot extends LitElement {
     // leaves it on for the newer fetch that already owns the token.
     this.loading = true;
 
-    // Each fetch reports its own cost, so clear the accumulating panels (byte
-    // meter, waterfall, layout heatmap) and the map before this area's requests.
-    this.resetViz();
-    this.mapView.clearLayers();
-    // The old view's layers are gone, so its pick provenance and any open popup
-    // are stale. Drop them before the new batches register their own.
-    this.pickFlats.clear();
-    this.mapView.closeFeaturePopup();
-
     const plan = this.strategy!.planRead(bbox, zoom);
     const indices = plan.indices;
     const column = plan.column;
@@ -683,6 +713,14 @@ export class AppRoot extends LitElement {
     // rather than imply the area was empty.
     const prunable = this.strategy!.prunable;
     if (indices.length === 0) {
+      // Tear down whatever is on screen, mirroring the changed-plan teardown
+      // below, so panning fully off-data blanks the map instead of leaving the
+      // previous view's geometry stuck under an empty-view status.
+      this.resetViz();
+      this.mapView.clearLayers();
+      this.pickFlats.clear();
+      this.mapView.closeFeaturePopup();
+      this.renderedPlanSig = null;
       this.pendingWorking.clear();
       this.flushVizNow(token);
       this.loading = false;
@@ -700,16 +738,10 @@ export class AppRoot extends LitElement {
 
     // Map each selected row group to its absolute row range, so hyparquet reads
     // exactly that group's column chunk over a range request.
-    const offsets: number[] = [];
-    let acc = 0;
-    for (const rg of metadata.rowGroups) {
-      offsets.push(acc);
-      acc += rg.rowCount;
-    }
     const ranges: RowGroupRange[] = indices.map((i) => ({
       index: i,
-      rowStart: offsets[i],
-      rowEnd: offsets[i] + metadata.rowGroups[i].rowCount,
+      rowStart: this.rowOffsets[i],
+      rowEnd: this.rowOffsets[i] + metadata.rowGroups[i].rowCount,
     }));
 
     // Only claim the active URL if this fetch is still current, so a fetch
@@ -725,6 +757,24 @@ export class AppRoot extends LitElement {
       // superseded this fetch.
       return;
     }
+    const sig = planSignature(column, readRanges);
+    // The resolved plan matches what is already painted, so the pixels would be
+    // identical. Refresh the viewport-derived readouts and leave the layers,
+    // pick provenance, and popup exactly as they are. This is the common case
+    // for an in-place pan over already-loaded data.
+    if (url === this.renderedUrl && sig === this.renderedPlanSig) {
+      this.fetchedIndices = new Set(readRanges.map((r) => r.index));
+      this.pendingWorking = new Set();
+      this.flushVizNow(token);
+      this.loading = false;
+      return;
+    }
+    // A genuine change, so tear down the old view now, not before refinement.
+    this.resetViz();
+    this.mapView.clearLayers();
+    this.pickFlats.clear();
+    this.mapView.closeFeaturePopup();
+    this.renderedPlanSig = null; // screen no longer shows the recorded plan
     // refineToPages drops a group whose pages all miss the view, so re-derive
     // the indices actually being read and update the panels, otherwise a dropped
     // group would sit listed as pending forever.
@@ -758,7 +808,11 @@ export class AppRoot extends LitElement {
     let decodeMs = 0;
     let uploadMs = 0;
     let batchOrdinal = 0;
-    const arrived: number[] = [];
+    // Unique row-group indices that have painted at least one batch. A page-pruned
+    // group now paints as several batches (one per page) under one index, so the
+    // fetched-group count and the status must count distinct groups, not batches,
+    // or they would run past `total`.
+    const arrived = new Set<number>();
     // Every batch's flattened buckets, cached-hit and freshly decoded alike, are
     // collected here and merged into one layer set per kind at fetch completion,
     // so a settled view holds a handful of layers instead of one per row group.
@@ -769,9 +823,14 @@ export class AppRoot extends LitElement {
     // group read via a different column at another level of detail, otherwise a
     // partial decode could be served to a later full read.
     const flatCache = getFlatCache(url);
-    const rangeSignature = (range: RowGroupRange): string =>
-      range.subRanges ? range.subRanges.map((s) => `${s.rowStart}-${s.rowEnd}`).join(',') : 'full';
-    const cacheKey = (range: RowGroupRange): string => `${column}\u0000${range.index}\u0000${rangeSignature(range)}`;
+    // A page-pruned group caches each kept page under its own stable
+    // [rowStart, rowEnd) key, so an overlapping pan reuses the decoded page even
+    // as the merged fetch spans jitter. A whole-group read keeps the stable
+    // 'full' key, the same shape whole-group entries used before, so those
+    // entries survive across pans too. Both use the same null separator as before.
+    const pageKey = (index: number, rowStart: number, rowEnd: number): string =>
+      `${column}\u0000${index}\u0000${rowStart}-${rowEnd}`;
+    const groupKey = (index: number): string => `${column}\u0000${index}\u0000full`;
 
     // Paint one batch progressively and collect its buckets for the end-of-fetch
     // merge. Shared by the cache-hit and fresh-decode paths so both update the
@@ -792,7 +851,7 @@ export class AppRoot extends LitElement {
       uploadMs += performance.now() - tUpload;
       batchOrdinal += 1;
 
-      arrived.push(...batchIndices);
+      for (const i of batchIndices) arrived.add(i);
       // Mutate the working set and coalesce the reactive flush with a rAF, so
       // several batches arriving in the same frame (or the same macrotask,
       // before the next paint) collapse into one `pendingIndices` update
@@ -806,7 +865,7 @@ export class AppRoot extends LitElement {
       this.summary = {
         fileBytes: this.fileBytes,
         rowGroupsTotal: metadata.rowGroups.length,
-        rowGroupsFetched: arrived.length,
+        rowGroupsFetched: arrived.size,
         features,
         vertices,
         metadataMs: this.metadataMs,
@@ -823,28 +882,53 @@ export class AppRoot extends LitElement {
         pagePrunedGroups: pagePruned,
         wholeGroups: total - pagePruned,
       };
-      this.status = `Painted ${arrived.length}/${total} row groups (${features.toLocaleString('en-US')} features)…`;
+      this.status = `Painted ${arrived.size}/${total} row groups (${features.toLocaleString('en-US')} features)…`;
     };
 
     // Split the read ranges into cache hits (skip the byte fetch and the decode
     // entirely) and misses (read and decode). The hit's byte cost is zero, so no
-    // fetch event fires and the byte accounting stays coherent.
-    const cachedHits: { range: RowGroupRange; cached: { flat: FlatGeometries; features: number } }[] = [];
+    // fetch event fires and the byte accounting stays coherent. A page-pruned
+    // group is split at page granularity, each kept page probes and decodes on its
+    // own, so an overlapping pan repaints the warm pages and reads only the newly
+    // visible ones. A whole-group read probes and decodes as one unit.
+    const cachedHits: { index: number; cached: { flat: FlatGeometries; features: number } }[] = [];
     const uncachedRanges: RowGroupRange[] = [];
+    // Which pages each page-pruned group keeps, so onBatch can map a decoded batch
+    // back to the page it belongs to (all rows of a single-page range fall inside
+    // that page). A whole-group read is absent here and caches under its group key.
+    const pagesByIndex = new Map<number, { rowStart: number; rowEnd: number }[]>();
     for (const range of readRanges) {
-      const cached = flatCache.get(cacheKey(range));
-      if (cached) cachedHits.push({ range, cached });
-      else uncachedRanges.push(range);
+      if (range.pages) {
+        pagesByIndex.set(range.index, range.pages);
+        for (const p of range.pages) {
+          const cached = flatCache.get(pageKey(range.index, p.rowStart, p.rowEnd));
+          if (cached) {
+            cachedHits.push({ index: range.index, cached });
+          } else {
+            // One read range per missing page, so each decodes and caches alone.
+            // Several may share an index, that is intended.
+            uncachedRanges.push({
+              index: range.index,
+              rowStart: range.rowStart,
+              rowEnd: range.rowEnd,
+              subRanges: [p],
+            });
+          }
+        }
+      } else {
+        const cached = flatCache.get(groupKey(range.index));
+        if (cached) cachedHits.push({ index: range.index, cached });
+        else uncachedRanges.push(range);
+      }
     }
-    const uncachedByIndex = new Map(uncachedRanges.map((r) => [r.index, r]));
 
     try {
-      // Repaint the cached groups first, instantly, then stream the misses in.
-      for (const { range, cached } of cachedHits) {
+      // Repaint the cached units first, instantly, then stream the misses in.
+      for (const { index, cached } of cachedHits) {
         if (token !== this.fetchToken) return;
         const t0 = performance.now();
-        emitEvent({ kind: 'work', phase: 'flatten-cache', label: `rg ${range.index}`, t0, t1: performance.now() });
-        paintBatch(cached.flat, cached.features, [range.index]);
+        emitEvent({ kind: 'work', phase: 'flatten-cache', label: `rg ${index}`, t0, t1: performance.now() });
+        paintBatch(cached.flat, cached.features, [index]);
       }
 
       await readColumnProgressive(
@@ -861,11 +945,24 @@ export class AppRoot extends LitElement {
         const flat = timeWork('wkb-decode', `${geometries.length} geometries`, () => plan.decode(geometries, rows));
         decodeMs += performance.now() - tDecode;
 
-        // Cache the per-group decode before merging, so a repeat view reuses it.
-        // Merging is per view, caching is per group, so the merged result is not
-        // cached.
-        const range = uncachedByIndex.get(batchIndices[0]);
-        if (range) flatCache.set(cacheKey(range), { flat, features: geometries.length });
+        // Cache the decoded bucket before merging, so a repeat view reuses it.
+        // Merging is per view, caching is per unit, so the merged result is not
+        // cached. A page-pruned group caches each page under its own stable key,
+        // identified by which page the batch's rows fall in (each miss range is a
+        // single page, so every row is inside that one page). A whole-group read
+        // caches as one unit under its group key.
+        const index = batchIndices[0];
+        const pages = pagesByIndex.get(index);
+        if (pages) {
+          if (rows.length > 0) {
+            const p = pages.find((pg) => rows[0] >= pg.rowStart && rows[0] < pg.rowEnd);
+            if (p) flatCache.set(pageKey(index, p.rowStart, p.rowEnd), { flat, features: geometries.length });
+          }
+          // An all-null page yields rows.length === 0, so there is no page to key
+          // on. Skip caching it, it is cheap to re-read and rare.
+        } else {
+          flatCache.set(groupKey(index), { flat, features: geometries.length });
+        }
 
         paintBatch(flat, geometries.length, batchIndices);
 
@@ -878,17 +975,35 @@ export class AppRoot extends LitElement {
       );
       if (token !== this.fetchToken) return;
       this.pendingWorking.clear();
-      // Atomically collapse the per-batch layers into one layer set per kind. The
-      // merged layers are built first, then swapped in with a single setLayers, so
-      // there is no frame where the map is empty.
-      const merged = mergeFlatGeometries(batches);
-      timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
-        this.mapView!.setLayers(buildLayers('rg-merged', merged)),
-      );
-      // The per-batch layers are gone, so their pick provenance is too. Register
-      // the merged buckets under the merged id the new layers carry.
-      this.pickFlats.clear();
-      this.pickFlats.set('rg-merged', merged);
+      if (batches.length > MERGE_LAYER_THRESHOLD) {
+        // Many batches, collapse to one layer set per kind to cut draw calls.
+        // The merged layers are built first, then swapped in with a single
+        // setLayers, so there is no frame where the map is empty.
+        let entry = this.mergedLayerCache.get(sig);
+        if (!entry) {
+          const merged = mergeFlatGeometries(batches);
+          const layers = buildLayers('rg-merged', merged);
+          entry = { layers, merged };
+          this.mergedLayerCache.set(sig, entry);
+          // Bound the cache to a small recent window.
+          if (this.mergedLayerCache.size > 6) {
+            const oldest = this.mergedLayerCache.keys().next().value as string;
+            this.mergedLayerCache.delete(oldest);
+          }
+        }
+        timeWork('gpu-upload', `${features.toLocaleString('en-US')} merged`, () =>
+          this.mapView!.setLayers(entry!.layers),
+        );
+        // The per-batch layers are gone, so their pick provenance is too. Register
+        // the SAME merged buckets these layers were built from, so a picked ordinal
+        // into the layers indexes the matching rowIds.
+        this.pickFlats.clear();
+        this.pickFlats.set('rg-merged', entry.merged);
+      }
+      // Small views keep their per-batch layers and per-batch pickFlats as is,
+      // already uploaded once during progressive paint. No second upload.
+      this.renderedPlanSig = sig;
+      this.renderedUrl = url;
       this.status = `Rendered ${features.toLocaleString('en-US')} features from ${total} row groups, ${readingLabel}.${pruneNote}`;
     } catch (err) {
       if (token !== this.fetchToken) return;
@@ -896,6 +1011,8 @@ export class AppRoot extends LitElement {
       // Clear the dedupe key so the same view can be retried without moving the
       // camera first.
       this.lastFetchKey = null;
+      // A failed fetch must not leave a stale signature claiming the screen.
+      this.renderedPlanSig = null;
       this.status = `Fetch failed. ${err instanceof Error ? err.message : String(err)}`;
     } finally {
       // Whatever happened, land the exact final pending state, never a stale
@@ -933,9 +1050,30 @@ export class AppRoot extends LitElement {
     // A prefetched file is fully resident, so page pruning saves no bytes and
     // would only add index reads and decode work. Read whole groups from memory.
     if (isFilePrefetched(url)) return ranges;
-    const lookup = schemaLookup(metadata.schema);
+    const lookup = this.schemaLookupCache ?? schemaLookup(metadata.schema);
     const transform = metadata.projection.transform;
     const memo = getPageRangeMemo(url);
+
+    // First pass, find every wide group not yet memoized and kick off its page
+    // index read without awaiting, so a whole-extent view with many wide coarse
+    // groups fires its round trips together instead of one after another. Each
+    // probe is wrapped so a thrown error resolves to null, matching the
+    // whole-group fallback the serial try/catch used to give per group.
+    const pending: Array<{ index: number; promise: Promise<PageRange[] | null> }> = [];
+    for (const range of ranges) {
+      const rg = metadata.rowGroups[range.index];
+      const raw = metadata.rawRowGroups[range.index];
+      const wideEnough = rg?.bbox && raw && bboxArea(rg.bbox) >= 4 * aoiArea;
+      if (!wideEnough || memo.has(range.index)) continue;
+      const probe = pageRangesForRowGroup(file, raw!, covering, range.rowStart, rg!.rowCount, transform, lookup).catch(
+        () => null,
+      );
+      pending.push({ index: range.index, promise: probe });
+    }
+    if (pending.length > 0) {
+      const resolved = await withPhase('page-index', () => Promise.all(pending.map((p) => p.promise)));
+      pending.forEach((p, i) => memo.set(p.index, resolved[i]));
+    }
 
     const out: RowGroupRange[] = [];
     for (const range of ranges) {
@@ -949,18 +1087,9 @@ export class AppRoot extends LitElement {
       // The page indexes are immutable for the file, and the per-page bboxes are
       // absolute, so the decoded pages are reused across every pan and zoom. Only
       // the AOI filter in mergePageRanges below is recomputed per view. A null
-      // memo value records a group that cannot be page pruned.
+      // memo value records a group that cannot be page pruned. The first pass
+      // above already populated the memo for every wide group, so this only reads.
       let pages = memo.get(range.index) ?? null;
-      if (!memo.has(range.index)) {
-        try {
-          pages = await withPhase('page-index', () =>
-            pageRangesForRowGroup(file, raw, covering, range.rowStart, rg.rowCount, transform, lookup),
-          );
-        } catch {
-          pages = null;
-        }
-        memo.set(range.index, pages);
-      }
       if (!pages) {
         out.push(range);
         continue;
@@ -975,7 +1104,7 @@ export class AppRoot extends LitElement {
         out.push(range);
         continue;
       }
-      out.push({ ...range, subRanges });
+      out.push({ ...range, subRanges, pages: keptPageRanges(pages, aoi) });
     }
     return out;
   }
