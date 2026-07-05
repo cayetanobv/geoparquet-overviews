@@ -750,6 +750,7 @@ export class AppRoot extends LitElement {
     this.mapView.clearLayers();
     this.pickFlats.clear();
     this.mapView.closeFeaturePopup();
+    this.renderedPlanSig = null; // screen no longer shows the recorded plan
     // refineToPages drops a group whose pages all miss the view, so re-derive
     // the indices actually being read and update the panels, otherwise a dropped
     // group would sit listed as pending forever.
