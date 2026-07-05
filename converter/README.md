@@ -32,6 +32,7 @@ The command prints stage logs to stderr and a JSON summary to stdout.
 | `--importance-column` | unset | Numeric column that ranks point features, largest first. Points are ranked by grid thinning when unset. |
 | `--native-geo/--no-native-geo` | on | Write `geometry` and `geom_overview` as the Parquet GEOMETRY logical type with per-row-group GeospatialStatistics, alongside the unchanged `geo` footer key. Dual write, GeoParquet 1.1 plus native 2.0-capable. |
 | `--bbox/--no-bbox` | on | Write the physical `bbox` covering column and its page index, Profile A. `--no-bbox` (Profile B) omits it and relies solely on native geospatial statistics for row-group pruning, requires `--native-geo` and has no page-level pruning. |
+| `--jobs`, `-j` | `0` | Worker threads for the overview build, the slowest stage. 0 is one per core, 1 forces single-threaded. shapely releases the GIL on the simplify and snap ops, so threads speed the overview build up nearly linearly. |
 | `-v`, `--verbose` | off | Verbose DEBUG logging. |
 | `-q`, `--quiet` | off | Only print the JSON summary, no stage logs. |
 

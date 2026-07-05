@@ -53,9 +53,10 @@ in order. Footer JSON builders live in `footer.py`, the CLI in `cli.py`.
    the finest band, empty bands are merged and renumbered contiguously.
 6. Hilbert sort. `_hilbert_distance` on quantized bbox centroids, then
    `np.lexsort((hilbert, band))`, band major, Hilbert minor.
-7. Overview build. `_build_overview` calls `_overview_values` per coarse band
-   with tolerances from `_overview_tolerances`, snapping through `_snap_safe`.
-   A pure point dataset skips this, `overview_method == "thin"`.
+7. Overview build. `_build_overview` calls `_overview_band` per coarse band,
+   which fans `_overview_values` across `jobs` threads, with tolerances from
+   `_overview_tolerances`, snapping through `_snap_safe`. A pure point dataset
+   skips this, `overview_method == "thin"`. See the Parallelism section.
 8. Row group planning. `_plan_row_groups`, coarse bands split into near equal
    chunks up to `coarse_row_groups`, the finest band cut by the exact geometry
    byte budget, every cut at a band boundary.
@@ -177,6 +178,36 @@ two are paired. Small outputs stay on `binary` exactly as before, so nothing
 changes for the common case. Parquet stores both as `BYTE_ARRAY`, so a reader
 sees no difference. Individual WKB values still must stay under 2 GB, but a
 single feature that large is not a real case.
+
+## Parallelism, `--jobs`
+
+The overview build is the converter's slowest stage, `simplify`, `make_valid`,
+and `set_precision` on the coarse-band geometry. shapely 2.x runs those as
+GEOS-backed numpy ufuncs that release the GIL, so plain Python threads
+parallelize them nearly linearly, no multiprocessing and no geometry pickling.
+Measured on a 10-core machine, threads over a batch of detailed polygons cut
+`simplify` plus `set_precision` by about 5x at 8 threads and `make_valid` by
+about 2.8x. `from_wkb` and `to_wkb` barely move, they are Python-object bound,
+so only the overview build is threaded, read and write already thread inside
+pyarrow.
+
+`_overview_band` splits a band's features into chunks and runs `_overview_values`
+on each through a `ThreadPoolExecutor`, then concatenates in order. The overview
+is a pure per-feature transform, so the threaded result is byte-identical to the
+single-threaded one, `test_threaded_overview_matches_single_thread` and
+`test_overview_band_chunking_preserves_order` are the tripwires, never weaken
+them. Chunk count is oversubscribed to `jobs * 4`, not one chunk per thread, on
+purpose. A band can be a handful of whole-country multipolygons that each cost
+seconds, and equal row splits would strand every thread but one, so more, smaller
+chunks let the pool balance uneven geometry. A single enormous multipolygon is
+still one GEOS call and cannot be split, so a file that is a few giant geometries
+parallelizes across features but not within one.
+
+`ConvertOptions.jobs` and the `--jobs/-j` CLI flag control it. 0 (default) is one
+thread per core, 1 forces single-threaded, and `_validate_options` rejects a
+negative count. Overall speedup follows Amdahl, near the full multiple on a
+geometry-heavy file where the overview build dominates, smaller when zstd write
+and WKB serialize are a large share of the wall time.
 
 ## Known limitations
 

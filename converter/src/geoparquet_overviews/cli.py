@@ -80,6 +80,14 @@ def main() -> None:
     show_default=True,
     help="Write the physical bbox covering column (Profile A). --no-bbox omits it and relies on native geospatial statistics only (Profile B), which disables page-level pruning.",
 )
+@click.option(
+    "--jobs",
+    "-j",
+    default=0,
+    show_default=True,
+    type=int,
+    help="Worker threads for the overview build, the slowest stage. 0 is one per core, 1 forces single-threaded.",
+)
 @click.option("-v", "--verbose", is_flag=True, help="Verbose (DEBUG) logging.")
 @click.option("-q", "--quiet", is_flag=True, help="Only print the JSON summary, no stage logs.")
 def convert_cmd(
@@ -94,6 +102,7 @@ def convert_cmd(
     importance_column: str | None,
     native_geo: bool,
     bbox: bool,
+    jobs: int,
     verbose: bool,
     quiet: bool,
 ) -> None:
@@ -110,6 +119,7 @@ def convert_cmd(
         importance_column=importance_column,
         native_geo=native_geo,
         bbox=bbox,
+        jobs=jobs,
     )
     summary = convert(src, dst, opts)
     click.echo(json.dumps(summary, indent=2))

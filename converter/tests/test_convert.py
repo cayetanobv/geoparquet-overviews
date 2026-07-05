@@ -390,6 +390,38 @@ def test_large_wkb_native_write_and_reconvert(tmp_path, monkeypatch):
     assert a.column("geometry").combine_chunks() == b.column("geometry").combine_chunks()
 
 
+def test_threaded_overview_matches_single_thread(tmp_path):
+    """The overview build is fanned across threads, so it must be byte-identical
+    to the single-threaded build. The overview is a pure per-feature transform,
+    threading only changes how the work is scheduled, never the result."""
+    src = tmp_path / "src.parquet"
+    one = tmp_path / "one.parquet"
+    many = tmp_path / "many.parquet"
+    _write_gpq(src, _make_polygons(600))
+    convert(str(src), str(one), ConvertOptions(bands=3, jobs=1))
+    convert(str(src), str(many), ConvertOptions(bands=3, jobs=4))
+    a, b = pq.read_table(one), pq.read_table(many)
+    assert a.column("geometry").to_pylist() == b.column("geometry").to_pylist()
+    assert a.column("geom_overview").to_pylist() == b.column("geom_overview").to_pylist()
+
+
+def test_overview_band_chunking_preserves_order():
+    """`_overview_band` splits a band across threads and concatenates, so its
+    output must match `_overview_values` element for element, in order."""
+    geoms = np.array(_make_polygons(250), dtype=object)
+    dims = shapely.get_dimensions(geoms)
+    single = convert_mod._overview_values(geoms, dims, 0.05, 0.01)
+    threaded = convert_mod._overview_band(geoms, dims, 0.05, 0.01, jobs=4)
+    assert single.tolist() == threaded.tolist()
+
+
+def test_negative_jobs_rejected(tmp_path):
+    src, dst = tmp_path / "s.parquet", tmp_path / "d.parquet"
+    _write_plain(src)
+    with pytest.raises(ValueError, match="jobs"):
+        convert(str(src), str(dst), ConvertOptions(jobs=-1))
+
+
 def test_sorting_columns_declares_band_leaf(tmp_path):
     """C4, sorting_columns points at the physical `band` leaf, not a bbox leaf."""
     src = tmp_path / "plain.parquet"

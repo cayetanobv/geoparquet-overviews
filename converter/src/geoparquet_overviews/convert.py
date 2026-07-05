@@ -18,11 +18,14 @@ group plan, and the final preview cost. The CLI turns this on by default.
 
 from __future__ import annotations
 
+import itertools
 import json
 import logging
 import math
+import os
 import re
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
 import numpy as np
@@ -91,6 +94,12 @@ class ConvertOptions:
     # lean 2.0), readers prune row groups from native geospatial statistics
     # only and page-level pruning is unavailable.
     bbox: bool = True
+    # Worker threads for the overview build, the converter's slowest stage.
+    # shapely's simplify, make_valid, and set_precision release the GIL, so
+    # threads parallelize them nearly linearly. 0 means auto (one per core),
+    # 1 forces single-threaded. Only the overview build is threaded, read and
+    # write already thread inside pyarrow.
+    jobs: int = 0
 
 
 def _find_geometry_column(schema: pa.Schema) -> str:
@@ -498,9 +507,37 @@ def _overview_values(src: np.ndarray, dims: np.ndarray, tol: float, grid: float)
     return out
 
 
+def _overview_band(
+    src: np.ndarray, dims: np.ndarray, tol: float, grid: float, jobs: int
+) -> np.ndarray:
+    """`_overview_values` for one coarse band, fanned out across `jobs` threads
+    when it helps. shapely's simplify, make_valid, and set_precision release the
+    GIL, so threads give a near-linear speedup on this, the converter's slowest
+    stage. The overview is a pure per-feature transform, so splitting the band,
+    processing each chunk, and concatenating in order is identical to one call.
+
+    Chunk count is oversubscribed past the worker count on purpose. A band can be
+    a handful of whole-country multipolygons that each cost seconds, so equal row
+    splits would strand most threads on the one enormous chunk. More, smaller
+    chunks let the pool balance the load. The chunks stay large enough that the
+    vectorized GEOS work dominates the thread hand-off."""
+    n = len(src)
+    if jobs <= 1 or n <= 1:
+        return _overview_values(src, dims, tol, grid)
+    nchunks = min(n, jobs * 4)
+    src_parts = np.array_split(src, nchunks)
+    dim_parts = np.array_split(dims, nchunks)
+    with ThreadPoolExecutor(max_workers=jobs) as ex:
+        parts = ex.map(
+            _overview_values, src_parts, dim_parts,
+            itertools.repeat(tol), itertools.repeat(grid),
+        )
+        return np.concatenate(list(parts))
+
+
 def _build_overview(
     geoms: np.ndarray, band: np.ndarray, dimensions: np.ndarray, bands: int,
-    span: float, grid: float, geom_bytes: np.ndarray,
+    span: float, grid: float, geom_bytes: np.ndarray, jobs: int = 1,
 ) -> tuple[np.ndarray, dict[int, float]]:
     """Build the overview WKB for every coarse band feature, per its dimension,
     NULL for the finest band. Returns a WKB object array and the tolerance used
@@ -516,7 +553,7 @@ def _build_overview(
         count = int(mask.sum())
         if count == 0:
             continue
-        wkb = _overview_values(geoms[mask], dimensions[mask], tol, grid)
+        wkb = _overview_band(geoms[mask], dimensions[mask], tol, grid, jobs)
         exact_bytes = int(geom_bytes[mask].sum())
         ov_bytes = int(sum(len(w) for w in wkb if w is not None))
         shrink = 100 * (1 - ov_bytes / exact_bytes) if exact_bytes else 0.0
@@ -629,6 +666,8 @@ def _validate_options(opts: ConvertOptions) -> None:
         raise ValueError(f"row_group_mb must be positive, got {opts.row_group_mb}")
     if opts.coarse_row_groups < 1:
         raise ValueError(f"coarse_row_groups must be at least 1, got {opts.coarse_row_groups}")
+    if opts.jobs < 0:
+        raise ValueError(f"jobs must be 0 (auto) or a positive count, got {opts.jobs}")
     if opts.overview_grid is not None and opts.overview_grid <= 0:
         raise ValueError(f"overview_grid must be positive, got {opts.overview_grid}")
     if opts.compression_level < 1:
@@ -804,8 +843,11 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
         band_tol = _overview_tolerances(bands, span)
         has_overview = False
     else:
-        log.info("building overview column")
-        overview_wkb, band_tol = _build_overview(geoms, band, dimensions, bands, span, grid, geom_bytes)
+        jobs = opts.jobs if opts.jobs > 0 else (os.cpu_count() or 1)
+        log.info("building overview column across %d thread(s)", jobs)
+        overview_wkb, band_tol = _build_overview(
+            geoms, band, dimensions, bands, span, grid, geom_bytes, jobs
+        )
         has_overview = any(v is not None for v in overview_wkb)
 
     budget = int(opts.row_group_mb * 1_000_000)
