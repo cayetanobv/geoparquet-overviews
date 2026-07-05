@@ -29,6 +29,7 @@ import { pageRangesForRowGroup, mergePageRanges } from '../data/pageindex';
 import { getPageRangeMemo, getFlatCache, isFilePrefetched } from '../data/file-cache';
 import { detectLayout, type LayoutStrategy } from '../data/layout';
 import { viewFetchKey } from './fetch-key';
+import { planSignature } from '../data/plan-signature';
 import { initialUrl, initialView, type CameraView } from '../data/presets';
 import { MapView } from '../map/map-view';
 import { buildLayers } from '../map/polygon-layer';
@@ -109,6 +110,10 @@ export class AppRoot extends LitElement {
   // first row of row group i.
   private rowOffsets: number[] = [];
   private schemaLookupCache: Map<string, SchemaElement> | null = null;
+  // Signature and url of the plan currently painted on screen. A fetch that
+  // resolves to the same signature leaves the layers untouched.
+  private renderedPlanSig: string | null = null;
+  private renderedUrl: string | null = null;
   // The flattened buckets currently on the map, keyed by the layer-set id prefix
   // (`rg-batch-N` during progressive load, `rg-merged` once settled). A click
   // resolves `info.layer.id` to a prefix and a geometry kind, then reads the
@@ -512,6 +517,8 @@ export class AppRoot extends LitElement {
     this.pendingWorking = new Set();
     this.flushVizNow(this.fetchToken);
     this.lastFetchKey = null;
+    this.renderedPlanSig = null;
+    this.renderedUrl = null;
     this.summary = null;
     this.fileFacts = null;
     this.busy = true;
@@ -678,15 +685,6 @@ export class AppRoot extends LitElement {
     // leaves it on for the newer fetch that already owns the token.
     this.loading = true;
 
-    // Each fetch reports its own cost, so clear the accumulating panels (byte
-    // meter, waterfall, layout heatmap) and the map before this area's requests.
-    this.resetViz();
-    this.mapView.clearLayers();
-    // The old view's layers are gone, so its pick provenance and any open popup
-    // are stale. Drop them before the new batches register their own.
-    this.pickFlats.clear();
-    this.mapView.closeFeaturePopup();
-
     const plan = this.strategy!.planRead(bbox, zoom);
     const indices = plan.indices;
     const column = plan.column;
@@ -735,6 +733,23 @@ export class AppRoot extends LitElement {
       // superseded this fetch.
       return;
     }
+    const sig = planSignature(column, readRanges);
+    // The resolved plan matches what is already painted, so the pixels would be
+    // identical. Refresh the viewport-derived readouts and leave the layers,
+    // pick provenance, and popup exactly as they are. This is the common case
+    // for an in-place pan over already-loaded data.
+    if (url === this.renderedUrl && sig === this.renderedPlanSig) {
+      this.fetchedIndices = new Set(readRanges.map((r) => r.index));
+      this.pendingWorking = new Set();
+      this.flushVizNow(token);
+      this.loading = false;
+      return;
+    }
+    // A genuine change, so tear down the old view now, not before refinement.
+    this.resetViz();
+    this.mapView.clearLayers();
+    this.pickFlats.clear();
+    this.mapView.closeFeaturePopup();
     // refineToPages drops a group whose pages all miss the view, so re-derive
     // the indices actually being read and update the panels, otherwise a dropped
     // group would sit listed as pending forever.
@@ -899,6 +914,8 @@ export class AppRoot extends LitElement {
       // the merged buckets under the merged id the new layers carry.
       this.pickFlats.clear();
       this.pickFlats.set('rg-merged', merged);
+      this.renderedPlanSig = sig;
+      this.renderedUrl = url;
       this.status = `Rendered ${features.toLocaleString('en-US')} features from ${total} row groups, ${readingLabel}.${pruneNote}`;
     } catch (err) {
       if (token !== this.fetchToken) return;
@@ -906,6 +923,8 @@ export class AppRoot extends LitElement {
       // Clear the dedupe key so the same view can be retried without moving the
       // camera first.
       this.lastFetchKey = null;
+      // A failed fetch must not leave a stale signature claiming the screen.
+      this.renderedPlanSig = null;
       this.status = `Fetch failed. ${err instanceof Error ? err.message : String(err)}`;
     } finally {
       // Whatever happened, land the exact final pending state, never a stale
