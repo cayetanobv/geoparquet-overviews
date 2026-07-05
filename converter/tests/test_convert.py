@@ -338,6 +338,58 @@ def test_reconvert_native_output_is_idempotent(tmp_path):
     assert a.column("geometry").combine_chunks() == b.column("geometry").combine_chunks()
 
 
+def test_decode_wkb_reads_multichunk_without_combining():
+    """A WKB column past 2 GB arrives as several row-group chunks and must decode
+    without a `combine_chunks()` that would overflow the 32-bit binary offset.
+    Exercised here on a multi-chunk column, both plain binary and the
+    geoarrow.wkb extension storage a re-converted native file carries."""
+    import geoarrow.pyarrow as ga
+
+    geoms = shapely.points(np.arange(6), np.arange(6))
+    wkb = shapely.to_wkb(geoms)
+    a, b = pa.array(wkb[:3], type=pa.binary()), pa.array(wkb[3:], type=pa.binary())
+
+    plain = pa.chunked_array([a, b])
+    assert plain.num_chunks == 2
+    out = convert_mod._decode_wkb(plain)
+    assert len(out) == 6 and shapely.to_wkb(out).tolist() == wkb.tolist()
+
+    ext = pa.chunked_array([ga.wkb().wrap_array(a), ga.wkb().wrap_array(b)])
+    out = convert_mod._decode_wkb(ext)
+    assert len(out) == 6 and shapely.to_wkb(out).tolist() == wkb.tolist()
+
+
+def test_large_binary_write_path_when_payload_would_overflow(tmp_path, monkeypatch):
+    """When the exact WKB would overflow a 32-bit `binary` array, the geometry
+    column is written as `large_binary`. Forced here by shrinking the threshold
+    rather than building a 2 GB fixture. The plain (non-native) path preserves
+    the large_binary storage on read, which is the observable proof."""
+    monkeypatch.setattr(convert_mod, "_MAX_BINARY_BYTES", 8)
+    src, dst = tmp_path / "src.parquet", tmp_path / "dst.parquet"
+    _write_plain(src)
+    convert(str(src), str(dst), ConvertOptions(bands=2, native_geo=False))
+    geom = pq.read_table(dst).column("geometry")
+    assert geom.type == pa.large_binary()
+    # Exact geometry survives the large_binary round trip.
+    assert all(g is not None for g in geom.to_pylist())
+
+
+def test_large_wkb_native_write_and_reconvert(tmp_path, monkeypatch):
+    """The native path must pair `large_binary` storage with `ga.large_wkb()`, a
+    `binary`-declared extension over `large_binary` storage miswrites its offsets
+    and crashes on write. Forcing the large path and then re-converting the
+    output proves both the large write and the decode of a large_wkb file."""
+    monkeypatch.setattr(convert_mod, "_MAX_BINARY_BYTES", 8)
+    src = tmp_path / "src.parquet"
+    once, twice = tmp_path / "once.parquet", tmp_path / "twice.parquet"
+    pq.write_table(_poly_table(), src)
+    convert(str(src), str(once), ConvertOptions(bands=2))
+    convert(str(once), str(twice), ConvertOptions(bands=2))
+    a, b = pq.read_table(once), pq.read_table(twice)
+    assert "geoarrow.wkb" in str(a.schema.field("geometry").type)
+    assert a.column("geometry").combine_chunks() == b.column("geometry").combine_chunks()
+
+
 def test_sorting_columns_declares_band_leaf(tmp_path):
     """C4, sorting_columns points at the physical `band` leaf, not a bbox leaf."""
     src = tmp_path / "plain.parquet"

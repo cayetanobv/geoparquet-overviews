@@ -156,6 +156,28 @@ converts, then re-converts that output, and asserts the second file, not just
 a synthetic one. `test_reconvert_native_output_is_idempotent` is the tripwire
 for native-typed round trips, never weaken it.
 
+## Large WKB columns, past 2 GB
+
+Arrow's `binary` type uses int32 value offsets, so one contiguous `binary`
+array holds at most 2 GB of payload. A WKB geometry column larger than that
+cannot be fused into a single `binary` array without an offset overflow, and
+the converter used to do exactly that on both read and write, so any input
+with more than ~2 GB of WKB (roughly a whole country of buildings) crashed
+with `ArrowInvalid: offset overflow`. Both sides now handle it. On read,
+`_decode_wkb` decodes the geometry column chunk by chunk, each row-group chunk
+is already under the limit, and concatenates the shapely results instead of
+calling `combine_chunks()`. It also drops the source geometry column before the
+Hilbert `take`, so the exact WKB is never reordered into one array only to be
+discarded. On write, `_geom_array` measures the payload and, past
+`_MAX_BINARY_BYTES` (2^31 - 1), builds `large_binary` (int64 offset) storage
+and wraps it with `ga.large_wkb()` instead of `ga.wkb()`. The extension's
+declared storage must match the array it wraps, a `binary` extension over a
+`large_binary` array miswrites its offsets and fails on write, which is why the
+two are paired. Small outputs stay on `binary` exactly as before, so nothing
+changes for the common case. Parquet stores both as `BYTE_ARRAY`, so a reader
+sees no difference. Individual WKB values still must stay under 2 GB, but a
+single feature that large is not a real case.
+
 ## Known limitations
 
 - Whole table in memory, not streaming. Tens of millions of features fit in a

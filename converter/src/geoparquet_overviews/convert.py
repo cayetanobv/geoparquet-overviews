@@ -42,6 +42,12 @@ _WORLD_DEG = 360.0
 _WORLD_M = 2 * math.pi * 6378137.0
 _FINE_MAX_ZOOM = 24
 
+# Arrow's `binary` type carries int32 value offsets, so one contiguous `binary`
+# array holds at most 2^31 - 1 bytes of payload. A WKB geometry column past that
+# must use `large_binary` (int64 offsets) instead, both when materializing it on
+# read and when building it on write. See `_decode_wkb` and `_geom_array`.
+_MAX_BINARY_BYTES = 2**31 - 1
+
 # Overview resolution ladder, expressed as a fraction of the dataset's larger
 # extent span. Unit-agnostic, identical in degrees or metres. Band 0 is the
 # coarse whole-extent preview and always resolves at `_COARSEST_REL` of the span,
@@ -579,15 +585,36 @@ def _bbox_struct(bounds: np.ndarray, valid: np.ndarray | None = None) -> pa.Arra
     )
 
 
-def _wkb_extension_type(native: bool, crs: object, crs_present: bool):
+def _decode_wkb(column: pa.ChunkedArray) -> np.ndarray:
+    """Decode a WKB geometry column to a shapely geometry array, one chunk at a
+    time. Each row-group chunk is already under Arrow's 2 GB `binary` limit, so
+    decoding chunk by chunk and concatenating the results never fuses the column
+    into a single int32-offset `binary` array. `combine_chunks()` would, and
+    overflows once the total WKB payload exceeds `_MAX_BINARY_BYTES`. Handles
+    both plain WKB storage and the geoarrow.wkb extension storage a re-converted
+    native file carries, unwrapping the extension to its binary storage first."""
+    parts = []
+    for chunk in column.chunks:
+        if isinstance(chunk, pa.ExtensionArray):
+            chunk = chunk.storage
+        parts.append(shapely.from_wkb(chunk.to_numpy(zero_copy_only=False)))
+    if not parts:
+        return np.empty(0, dtype=object)
+    return parts[0] if len(parts) == 1 else np.concatenate(parts)
+
+
+def _wkb_extension_type(native: bool, crs: object, crs_present: bool, large: bool):
     """The geoarrow.wkb extension type carrying the source CRS, or None when
     native types are disabled. pyarrow 21+ converts this to the Parquet
-    GEOMETRY logical type and computes GeospatialStatistics on write."""
+    GEOMETRY logical type and computes GeospatialStatistics on write. `large`
+    selects `ga.large_wkb()` (large_binary storage) over `ga.wkb()` (binary),
+    which must match the storage array it wraps, a binary extension over a
+    large_binary array miswrites its offsets."""
     if not native:
         return None
     import geoarrow.pyarrow as ga
 
-    gtype = ga.wkb()
+    gtype = ga.large_wkb() if large else ga.wkb()
     if crs_present and crs is not None:
         gtype = gtype.with_crs(json.dumps(crs) if isinstance(crs, dict) else str(crs))
     return gtype
@@ -659,7 +686,7 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     importance_values = _importance_values(table, opts.importance_column)
 
     t = time.perf_counter()
-    geoms = shapely.from_wkb(table.column(geom_col).combine_chunks().to_numpy(zero_copy_only=False))
+    geoms = _decode_wkb(table.column(geom_col))
     bounds = shapely.bounds(geoms)  # (n, 4) xmin ymin xmax ymax
     area = shapely.area(geoms)
     length = shapely.length(geoms)
@@ -740,6 +767,22 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
     hilbert = _hilbert_distance(qx, qy, order)
 
     sort_idx = np.lexsort((hilbert, band))  # band major, hilbert minor
+
+    # Drop the source geometry and any pre-existing overview columns before the
+    # reorder. It keeps re-converting the converter's own output idempotent (no
+    # duplicated `band`, `geom_overview`, or stale `geometry`), and it keeps the
+    # exact WKB, already decoded into `geoms` above, out of the `take`. Carrying
+    # a >2 GB WKB column through `take` would fuse it into a single int32-offset
+    # `binary` array and overflow, and the reordered copy is discarded here
+    # anyway. Nothing reads these columns off `table` after the decode above.
+    drop = [geom_col]
+    for c in ("geometry", "geom_overview", "band", "bbox"):
+        if c in table.column_names and c not in drop:
+            drop.append(c)
+    if len(drop) > 1:
+        log.info("dropping pre-existing overview columns before rewrite, %s", drop)
+    table = table.drop_columns(drop)
+
     table = table.take(pa.array(sort_idx))
     geoms = geoms[sort_idx]
     bounds = bounds[sort_idx]
@@ -776,16 +819,9 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
         opts.coarse_row_groups,
     )
 
-    # Assemble the output columns. Drop the source geometry and any pre-existing
-    # overview columns so re-converting the converter's own output is idempotent
-    # instead of duplicating `band`, `geom_overview`, or a stale `geometry`.
-    drop = [geom_col]
-    for c in ("geometry", "geom_overview", "band", "bbox"):
-        if c in table.column_names and c not in drop:
-            drop.append(c)
-    if len(drop) > 1:
-        log.info("dropping pre-existing overview columns before rewrite, %s", drop)
-    table = table.drop_columns(drop)
+    # The source geometry and any pre-existing overview columns were already
+    # dropped before the sort above, so `table` now holds only the passthrough
+    # attribute columns, ready for the rebuilt geometry, bbox, band, and overview.
 
     # set_precision snapping can move overview vertices up to grid/2 outward, so a
     # coarse-band feature's overview pixel can leave its exact-geometry bbox. Pad
@@ -810,10 +846,18 @@ def convert(src: str, dst: str, opts: ConvertOptions | None = None) -> dict:
             if m.any() else None
         )
 
-    gtype = _wkb_extension_type(opts.native_geo, crs if crs_present else None, crs_present)
-
     def _geom_array(values: np.ndarray) -> pa.Array:
-        storage = pa.array(values, type=pa.binary())
+        # Plain `binary` (int32 offsets) unless the column's total WKB would
+        # overflow it, then `large_binary` (int64). Small outputs stay on binary
+        # exactly as before, a multi-GB exact-geometry column writes without a
+        # 32-bit offset overflow. The extension type must match the storage, so
+        # `large` selects `ga.large_wkb()` over `ga.wkb()`.
+        total = int(sum(len(v) for v in values if v is not None))
+        large = total > _MAX_BINARY_BYTES
+        storage = pa.array(values, type=pa.large_binary() if large else pa.binary())
+        gtype = _wkb_extension_type(
+            opts.native_geo, crs if crs_present else None, crs_present, large
+        )
         return gtype.wrap_array(storage) if gtype is not None else storage
 
     table = table.append_column("geometry", _geom_array(geom_wkb))
