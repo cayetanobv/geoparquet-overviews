@@ -13,9 +13,11 @@ node_modules/
 .vite/
 
 # Parquet files are never committed, except the small bundled demo the viewer
-# loads by default. Large fixtures and converter outputs stay local only.
+# loads by default. Large fixtures, converter outputs, and any GeoPackage
+# exports derived from them stay local only.
 *.parquet
 !viewer/public/sample.parquet
+*.gpkg
 
 # Local tooling and editor state
 .claude/
